@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+*-mapped_*/
+*_steps_*.txt
+*_stepdump_*/
+*.stack.bin
+
+*.o
+*.out
+main
