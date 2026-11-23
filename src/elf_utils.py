@@ -28,6 +28,9 @@ EM_AARCH64 = 183
 PT_LOAD = 1
 PF_X = 1
 
+SHT_SYMTAB = 2
+STT_FUNC = 2
+
 MACHINE_MAP = {
     EM_386: ("i386", 32),
     EM_ARM: ("arm", 32),
@@ -63,6 +66,7 @@ class ElfInfo:
     segments: list[LoadSegment]
     text_range: tuple[int, int] | None = None
     plt_ranges: list[tuple[int, int]] = field(default_factory=list)
+    functions: list[str] = field(default_factory=list)
 
     def contains_vaddr(self, addr: int) -> bool:
         for seg in self.segments:
@@ -152,35 +156,57 @@ def parse_elf(path: Path) -> ElfInfo:
 
     text_range: tuple[int, int] | None = None
     plt_ranges: list[tuple[int, int]] = []
-    if e_shoff and e_shnum and e_shstrndx < e_shnum:
-        shstr_hdr_off = e_shoff + e_shstrndx * e_shentsize
-        if shstr_hdr_off + e_shentsize <= len(data):
+    section_headers: list[tuple[int, int, int, int, int, int, int]] = []
+
+    if e_shoff and e_shnum:
+        for i in range(e_shnum):
+            soff = e_shoff + i * e_shentsize
+            if soff + (64 if bits == 64 else 40) > len(data):
+                break
             if bits == 64:
-                _sn, _st, _sf, _sa, shstr_off, shstr_sz = struct.unpack(
-                    endian + "IIQQQQ", data[shstr_hdr_off:shstr_hdr_off + 40]
+                sh_name, sh_type, _sh_flags, sh_addr, sh_off, sh_size, sh_link, _sh_info, _sh_aa, sh_entsize = struct.unpack(
+                    endian + "IIQQQQIIQQ", data[soff:soff + 64]
                 )
             else:
-                _sn, _st, _sf, _sa, shstr_off, shstr_sz = struct.unpack(
-                    endian + "IIIIII", data[shstr_hdr_off:shstr_hdr_off + 24]
+                sh_name, sh_type, _sh_flags, sh_addr, sh_off, sh_size, sh_link, _sh_info, _sh_aa, sh_entsize = struct.unpack(
+                    endian + "IIIIIIIIII", data[soff:soff + 40]
                 )
-            shstrtab = data[shstr_off:shstr_off + shstr_sz]
-            for i in range(e_shnum):
-                soff = e_shoff + i * e_shentsize
-                if soff + e_shentsize > len(data):
-                    break
+            section_headers.append((sh_name, sh_type, sh_addr, sh_off, sh_size, sh_link, sh_entsize))
+
+    shstrtab = b""
+    if 0 <= e_shstrndx < len(section_headers):
+        _sn, _st, _sa, s_off, s_sz, _sl, _se = section_headers[e_shstrndx]
+        shstrtab = data[s_off:s_off + s_sz]
+
+    functions_set: set[str] = set()
+    for sh_name, sh_type, sh_addr, sh_off, sh_size, sh_link, sh_entsize in section_headers:
+        name = _read_cstr(shstrtab, sh_name)
+        if name == ".text" and sh_size > 0:
+            text_range = (sh_addr, sh_addr + sh_size)
+        elif name.startswith(".plt") and sh_size > 0:
+            plt_ranges.append((sh_addr, sh_addr + sh_size))
+        elif sh_type == SHT_SYMTAB and sh_entsize > 0 and 0 <= sh_link < len(section_headers):
+            _ln, _lt, _la, str_off, str_sz, _ll, _le = section_headers[sh_link]
+            strtab = data[str_off:str_off + str_sz]
+            sym_end = min(len(data), sh_off + sh_size)
+            pos = sh_off
+            while pos + sh_entsize <= sym_end:
                 if bits == 64:
-                    sh_name, _sh_type, _sh_flags, sh_addr, _sh_off, sh_size = struct.unpack(
-                        endian + "IIQQQQ", data[soff:soff + 40]
+                    st_name, st_info, _st_other, _st_shndx, st_value, _st_size = struct.unpack(
+                        endian + "IBBHQQ", data[pos:pos + 24]
                     )
                 else:
-                    sh_name, _sh_type, _sh_flags, sh_addr, _sh_off, sh_size = struct.unpack(
-                        endian + "IIIIII", data[soff:soff + 24]
+                    st_name, st_value, _st_size, st_info, _st_other, _st_shndx = struct.unpack(
+                        endian + "IIIBBH", data[pos:pos + 16]
                     )
-                name = _read_cstr(shstrtab, sh_name)
-                if name == ".text" and sh_size > 0:
-                    text_range = (sh_addr, sh_addr + sh_size)
-                elif name.startswith(".plt") and sh_size > 0:
-                    plt_ranges.append((sh_addr, sh_addr + sh_size))
+                if (st_info & 0xF) == STT_FUNC and st_value != 0:
+                    fn_name = _read_cstr(strtab, st_name)
+                    if fn_name:
+                        functions_set.add(fn_name)
+                pos += sh_entsize
+
+    user_fns = sorted(f for f in functions_set if not f.startswith("_"))
+    internal_fns = sorted(f for f in functions_set if f.startswith("_"))
 
     base_vaddr = min((s.vaddr for s in segments), default=0)
     return ElfInfo(
@@ -196,6 +222,7 @@ def parse_elf(path: Path) -> ElfInfo:
         segments=segments,
         text_range=text_range,
         plt_ranges=plt_ranges,
+        functions=user_fns + internal_fns,
     )
 
 

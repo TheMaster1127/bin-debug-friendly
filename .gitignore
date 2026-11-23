@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 
 *-mapped_*/
+record-*/
+record-*.txt
 *_steps_*.txt
 *_stepdump_*/
 *.stack.bin
@@ -11,3 +13,4 @@ __pycache__/
 *.o
 *.out
 main
+test2

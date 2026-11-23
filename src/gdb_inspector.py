@@ -221,6 +221,68 @@ class GdbInspectorMixin:
                 return str(func)
         return None
 
+    def get_binary_functions(self) -> list[str]:
+        """
+        Returns ONLY functions belonging to the target binary (from its ELF .symtab +
+        PLT/call targets inside .text), completely excluding libc/ld.so symbols.
+        """
+        cached = getattr(self, "_cached_functions", None)
+        if cached is not None:
+            return cached
+
+        funcs: list[str] = list(self.elf.functions)
+        seen = set(funcs)
+
+        # Also inspect .plt / .text calls (helpful for PLT entries and stripped binaries)
+        if not self.exited and self.started:
+            pc = self.get_pc()
+            if pc is not None:
+                bounds = self.get_current_exec_bounds(pc)
+                if bounds:
+                    lo, hi = bounds
+                    insns = self.disassemble_range(lo, min(hi, lo + 16384))
+                    for _a, _op, text in insns:
+                        parts = text.strip().split(None, 1)
+                        if not parts or parts[0].lower() not in ("call", "callq", "bl", "blr", "blx"):
+                            continue
+                        operands = parts[1] if len(parts) > 1 else ""
+                        m_sym = re.search(r"<([^>]+)>", operands)
+                        if m_sym:
+                            cname = m_sym.group(1)
+                            if cname not in seen:
+                                seen.add(cname)
+                                funcs.append(cname)
+
+        self._cached_functions = funcs
+        return funcs
+
+    def find_upcoming_call(self, pc: int, target_name: str) -> tuple[int, str, bool] | None:
+        bounds = self.get_current_exec_bounds(pc)
+        end_addr = min(bounds[1], pc + 8192) if bounds else (pc + 4096)
+        insns = self.disassemble_range(pc, end_addr)
+        target_low = target_name.strip().lower()
+
+        for addr, _op, text in insns:
+            parts = text.strip().lower().split(None, 1)
+            if not parts or parts[0] not in ("call", "callq", "bl", "blr", "blx"):
+                continue
+            operands = parts[1] if len(parts) > 1 else ""
+            if f"<{target_low}>" in operands or f"<{target_low}@plt>" in operands or operands == target_low:
+                return addr, text, ("@plt" in operands)
+
+        for addr, _op, text in insns:
+            parts = text.strip().lower().split(None, 1)
+            if not parts or parts[0] not in ("call", "callq", "bl", "blr", "blx"):
+                continue
+            operands = parts[1] if len(parts) > 1 else ""
+            m_sym = re.search(r"<([^>]+)>", operands)
+            if m_sym and target_low in m_sym.group(1).lower():
+                return addr, text, ("@plt" in m_sym.group(1).lower())
+            if target_low in operands:
+                return addr, text, ("@plt" in operands)
+
+        return None
+
     def get_binary_call_frames(self) -> list[dict]:
         res = self.send("-stack-list-frames")
         if res["status"] != "done":

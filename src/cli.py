@@ -1,15 +1,10 @@
 # Copyright (C) 2026 bin-debug-friendly contributors
 # License: GNU GPLv3 (https://www.gnu.org/licenses/gpl-3.0.html)
 
-try:
-    import readline
-    readline.set_history_length(1000)
-except ImportError:
-    readline = None
-
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +13,7 @@ from src.config import (
     EU_FOLDER_TS_FORMAT,
     EU_LOG_TS_FORMAT,
     MAX_INTERACTIVE_STEPS,
+    RECORD_DISAS_CONTEXT,
     STACK_PREVIEW_LINES,
 )
 from src.elf_utils import parse_address_input
@@ -26,12 +22,16 @@ from src.formatters import (
     format_disas_line,
     format_reg_line,
     format_xxd_lines,
+    handle_ignore_command,
     parse_set_value,
     print_help,
     print_stop_banner,
+    prompt_for_target_stdin,
+    setup_readline_completer,
 )
 from src.gdb_session import GdbSession
 from src.live_view import run_live_view
+from src.recorder import SessionRecorder
 
 
 def handle_ls_command(session: GdbSession, raw_cmd: str, rest: str) -> None:
@@ -166,16 +166,81 @@ def handle_step_with_dump(session: GdbSession, step_over: bool, count: int, dump
     print_stop_banner(session, stopped)
 
 
-def run_interactive_cli(session: GdbSession) -> None:
+def _record_cli_event(
+    session: GdbSession,
+    recorder: SessionRecorder | None,
+    raw_line: str,
+    t0: float,
+    prev_regs: dict[str, int],
+    stdout_text: str = "",
+    note: str = "",
+) -> None:
+    if recorder is None:
+        return
+    dur = (time.time() - t0) * 1000.0
+    if session.exited:
+        recorder.record_event(
+            command=raw_line,
+            duration_ms=dur,
+            pc_disp="EXITED",
+            func_name="exited",
+            disas_lines=[],
+            regs={},
+            prev_regs=prev_regs,
+            stack_lines=[],
+            stdout_text=stdout_text,
+            note=f"exit_code={session.exit_code}" if not note else note,
+        )
+        return
+    pc = session.get_pc()
+    fn = session.get_current_function() or "??"
+    pc_disp = f"0x{session.to_display_addr(pc):x}" if pc is not None else "?"
+    ctx_insns, pc_idx, _, _ = (
+        session.disassemble_context(pc, RECORD_DISAS_CONTEXT, RECORD_DISAS_CONTEXT, func_name=fn)
+        if pc is not None
+        else ([], -1, False, False)
+    )
+    disas_lines = [
+        format_disas_line(session, a, op, insn, is_current=(idx == pc_idx))
+        for idx, (a, op, insn) in enumerate(ctx_insns)
+    ]
+    regs = session.get_registers()
+    lo, hi, sp, _ = session.get_stack_bounds()
+    active_len = min(max(64, hi - sp), 64 * 1024)
+    sdata = session.read_memory(sp, active_len) or b""
+    slines = format_xxd_lines(sdata, sp, sp) if sdata else []
+    recorder.record_event(
+        command=raw_line,
+        duration_ms=dur,
+        pc_disp=pc_disp,
+        func_name=fn,
+        disas_lines=disas_lines,
+        regs=regs,
+        prev_regs=prev_regs,
+        stack_lines=slines,
+        stdout_text=stdout_text,
+        note=note,
+    )
+
+
+def run_interactive_cli(session: GdbSession, recorder: SessionRecorder | None = None) -> None:
+    session.stdin_prompt_handler = prompt_for_target_stdin
+    setup_readline_completer(session)
+
     print(
         f"\n[+] Ready | {session.host_binary_path.name} "
         f"| {session.elf.arch} ({session.elf.bits}-bit) "
         f"| PIE={'yes' if session.elf.is_pie else 'no'}"
     )
+    if recorder is not None:
+        print(f"[*] Session recording active -> {recorder.out_dir}/")
     print_stop_banner(session, {"reason": "ready"})
-    print("Type 'help' for commands (try 'view' for live window, or '0x...' to jump/run there).")
+    print("Type 'help' for commands (try 'view', 'call <func>' with Tab completion, or '0x...').")
 
     while True:
+        if recorder is not None:
+            recorder.flush_idle()
+
         try:
             raw_line = input(build_prompt(session)).strip()
         except (EOFError, KeyboardInterrupt):
@@ -185,35 +250,84 @@ def run_interactive_cli(session: GdbSession) -> None:
         if not raw_line:
             continue
 
+        t0 = time.time()
+        prev_regs = session.get_registers() if (recorder is not None and not session.exited and session.started) else {}
+
         parts = raw_line.split(None, 1)
         cmd = parts[0].lower()
         rest = parts[1].strip() if len(parts) > 1 else ""
 
         if cmd in ("quit", "exit", "q"):
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
             break
 
         if cmd in ("help", "?"):
             print_help()
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
+            continue
+
+        ign_msg = handle_ignore_command(session, raw_line)
+        if ign_msg is not None:
+            print(f"[*] {ign_msg}")
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0, note=ign_msg)
+            continue
+
+        if cmd == "stdin":
+            if not rest:
+                print("[!] Usage: stdin <input_line>")
+                continue
+            session.write_target_stdin(rest)
+            msg = f"Queued stdin line: {rest!r}"
+            print(f"[+] {msg}")
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0, note=msg)
             continue
 
         if cmd in ("view", "follow", "live"):
-            run_live_view(session, rest.split())
+            run_live_view(session, rest.split(), recorder=recorder)
             continue
 
         if cmd == "ls" or re.fullmatch(r"ls\d+", cmd):
             handle_ls_command(session, cmd, rest)
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
             continue
 
         if cmd in ("start", "restart"):
             stopped = session.restart_to_entry()
+            out_s = session.pop_target_output()
+            if out_s:
+                print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
             print_stop_banner(session, stopped)
+            _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s)
             continue
 
         if cmd == "main":
             ok, msg, stopped = session.stop_at_symbol("main")
             print(f"[{'+' if ok else '!'}] {msg}")
             if ok:
+                out_s = session.pop_target_output()
+                if out_s:
+                    print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
                 print_stop_banner(session, stopped)
+                _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s, note=msg)
+            continue
+
+        if cmd == "call":
+            if not rest:
+                print("[!] Usage: call <function_name> [--ignore] (press Tab to autocomplete)")
+                continue
+            ok, msg, stopped = session.run_to_next_call(rest)
+            print(f"[{'+' if ok else '!'}] {msg}")
+            if ok:
+                out_s = session.pop_target_output()
+                if out_s:
+                    print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
+                print_stop_banner(session, stopped)
+                _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s, note=msg)
             continue
 
         if cmd in ("jump", "jmp"):
@@ -225,6 +339,7 @@ def run_interactive_cli(session: GdbSession) -> None:
             print(f"[{'+' if ok else '!'}] {msg}")
             if ok:
                 print_stop_banner(session, {"reason": "jumped"})
+                _record_cli_event(session, recorder, raw_line, t0, prev_regs, note=msg)
             continue
 
         if cmd in ("stop", "b", "break"):
@@ -235,21 +350,35 @@ def run_interactive_cli(session: GdbSession) -> None:
                 ok, msg, stopped = session.stop_at_symbol("main")
                 print(f"[{'+' if ok else '!'}] {msg}")
                 if ok:
+                    out_s = session.pop_target_output()
+                    if out_s:
+                        print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
                     print_stop_banner(session, stopped)
+                    _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s, note=msg)
                 continue
             parsed_addr, clean_sym = parse_address_input(rest)
             ok, msg = session.set_breakpoint(parsed_addr, clean_sym)
             print(f"[{'+' if ok else '!'}] {msg}")
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0, note=msg)
             continue
 
         if cmd in ("run", "r"):
             stopped = session.run_or_continue(restart_if_exited=True)
+            out_s = session.pop_target_output()
+            if out_s:
+                print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
             print_stop_banner(session, stopped)
+            _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s)
             continue
 
         if cmd in ("continue", "c", "cont"):
             stopped = session.run_or_continue(restart_if_exited=False)
+            out_s = session.pop_target_output()
+            if out_s:
+                print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
             print_stop_banner(session, stopped)
+            _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s)
             continue
 
         if cmd == "skip":
@@ -257,7 +386,11 @@ def run_interactive_cli(session: GdbSession) -> None:
             if not ok:
                 print(f"[!] {msg}")
             else:
+                out_s = session.pop_target_output()
+                if out_s:
+                    print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
                 print_stop_banner(session, stopped)
+                _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s, note=msg)
             continue
 
         if cmd in ("next", "n", "ni", "step", "s", "si"):
@@ -278,6 +411,7 @@ def run_interactive_cli(session: GdbSession) -> None:
                 dump_tokens = [t.lower() for t in tokens[dump_idx + 1:]]
                 mode = ("all" if "all" in dump_tokens else "ends") if "stack" in dump_tokens else None
                 handle_step_with_dump(session, step_over, count, mode)
+                _record_cli_event(session, recorder, raw_line, t0, prev_regs)
                 continue
             if tokens:
                 try:
@@ -289,7 +423,11 @@ def run_interactive_cli(session: GdbSession) -> None:
                     print(f"[!] Usage: {cmd} [count] [dump [stack [all]]]")
                     continue
             stopped = session.step_instruction(count, step_over=step_over)
+            out_s = session.pop_target_output()
+            if out_s:
+                print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
             print_stop_banner(session, stopped)
+            _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s)
             continue
 
         if cmd in ("info", "show"):
@@ -302,12 +440,16 @@ def run_interactive_cli(session: GdbSession) -> None:
             low_rest = rest.lower()
             if low_rest in ("raw stack", "stack only"):
                 print_stack_preview(session)
+                if recorder is not None:
+                    recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
                 continue
             if low_rest == "stack":
                 for rname, val in session.get_registers().items():
                     print(format_reg_line(session, rname, val, DEFAULT_INFO_FORMAT))
                 print()
                 print_stack_preview(session)
+                if recorder is not None:
+                    recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
                 continue
 
             tokens = rest.split()
@@ -337,10 +479,14 @@ def run_interactive_cli(session: GdbSession) -> None:
                 rname, val = res
                 explicit_fmt = any(t.lower() in fmt_flags for t in tokens)
                 print(format_reg_line(session, rname, val, fmt if explicit_fmt else "all"))
+                if recorder is not None:
+                    recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
                 continue
 
             for rname, val in session.get_registers().items():
                 print(format_reg_line(session, rname, val, fmt))
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
             continue
 
         if cmd == "get":
@@ -357,6 +503,8 @@ def run_interactive_cli(session: GdbSession) -> None:
                 print(f"[!] Register '{rest}' not found.")
                 continue
             print(format_reg_line(session, res[0], res[1], "all"))
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
             continue
 
         if cmd == "set":
@@ -376,6 +524,8 @@ def run_interactive_cli(session: GdbSession) -> None:
                 continue
             ok, msg = session.set_register(m.group(1), val)
             print(f"[{'+' if ok else '!'}] {msg}")
+            if ok:
+                _record_cli_event(session, recorder, raw_line, t0, prev_regs, note=msg)
             continue
 
         if cmd == "dump" and rest.lower().startswith("stack"):
@@ -420,6 +570,8 @@ def run_interactive_cli(session: GdbSession) -> None:
                     print(text)
             else:
                 print_stack_preview(session)
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
             continue
 
         if cmd in ("disas", "disassemble", "d"):
@@ -447,6 +599,8 @@ def run_interactive_cli(session: GdbSession) -> None:
             pc = session.get_pc()
             for a, op, insn in session.disassemble_at(target_addr, count):
                 print(format_disas_line(session, a, op, insn, is_current=(a == pc)))
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
             continue
 
         if cmd == "maps":
@@ -457,9 +611,10 @@ def run_interactive_cli(session: GdbSession) -> None:
                 session.ensure_started_paused()
             for m in session.get_proc_mappings():
                 print(f"  0x{m['start']:016x}-0x{m['end']:016x} ({m['size']:>8} B) {m['perms']:<5} {m['objfile']}")
+            if recorder is not None:
+                recorder.record_command_only(raw_line, (time.time() - t0) * 1000.0)
             continue
 
-        # Direct `0x...` hex address shortcut: run/stop right at that address
         compact_raw = re.sub(r"\s+", "", raw_line.strip("\"'"))
         if compact_raw.lower().startswith("0x"):
             parsed_addr, _sym = parse_address_input(raw_line)
@@ -467,7 +622,11 @@ def run_interactive_cli(session: GdbSession) -> None:
                 ok, msg, stopped = session.goto_address(parsed_addr)
                 print(f"[{'+' if ok else '!'}] {msg}")
                 if ok:
+                    out_s = session.pop_target_output()
+                    if out_s:
+                        print(f"--- program stdout ---\n{out_s.rstrip()}\n----------------------")
                     print_stop_banner(session, stopped)
+                    _record_cli_event(session, recorder, raw_line, t0, prev_regs, stdout_text=out_s, note=msg)
                 continue
 
         print(f"[!] Unknown command '{cmd}'. Type 'help' for available commands.")

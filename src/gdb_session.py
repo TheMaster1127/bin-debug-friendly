@@ -21,6 +21,11 @@ from src.sandbox import (
 )
 
 ARG0_REG = {"x86_64": "rdi", "aarch64": "x0", "arm": "r0"}
+CALL_MNEMONICS = {"call", "callq", "bl", "blr", "blx"}
+INPUT_FUNC_HINTS = (
+    "fgets", "gets", "scanf", "__isoc99_scanf", "getchar",
+    "getc", "fgetc", "getline", "getdelim", "read@plt",
+)
 
 
 def _pc_from_stopped(stopped: dict | None) -> int | None:
@@ -33,6 +38,78 @@ def _pc_from_stopped(stopped: dict | None) -> int | None:
         except Exception:
             return None
     return None
+
+
+def _is_call_insn(insn_text: str) -> bool:
+    parts = insn_text.strip().lower().split(None, 1)
+    return bool(parts and parts[0] in CALL_MNEMONICS)
+
+
+def _looks_like_stdin_call(insn_text: str) -> bool:
+    low = insn_text.lower()
+    return any(tok in low for tok in INPUT_FUNC_HINTS)
+
+
+class IgnoreCallManager:
+    def __init__(self):
+        self.mode = "none"
+        self.remaining = 0
+        self.nest_base_depth = 0
+
+    def clear(self) -> str:
+        self.mode = "none"
+        self.remaining = 0
+        return "Call ignoring disabled (normal step)."
+
+    def set_all(self) -> str:
+        self.mode = "all"
+        self.remaining = 0
+        return "Ignoring ALL calls during step (`unignore call` to resume)."
+
+    def set_count(self, n: int) -> str:
+        self.mode = "count"
+        self.remaining = max(1, n)
+        label = "once" if self.remaining == 1 else f"{self.remaining} times"
+        return f"Ignoring calls {label}."
+
+    def set_nest(self, current_depth: int) -> str:
+        self.mode = "nest"
+        self.remaining = 0
+        self.nest_base_depth = current_depth
+        return f"Ignoring nested calls (allowing 1 level from depth {current_depth})."
+
+    def status_label(self) -> str:
+        if self.mode == "all":
+            return "ignore=all"
+        if self.mode == "count":
+            return f"ignore={self.remaining}"
+        if self.mode == "nest":
+            return f"ignore=nest(d>{self.nest_base_depth})"
+        return "ignore=off"
+
+    def should_skip_call_at_pc(self, session: "GdbSession", pc: int | None) -> bool:
+        if self.mode == "none" or pc is None:
+            return False
+        insns = session.disassemble_at(pc, count=1)
+        if not insns or not _is_call_insn(insns[0][2]):
+            return False
+        if self.mode == "all":
+            return True
+        if self.mode == "count":
+            if self.remaining > 0:
+                self.remaining -= 1
+                if self.remaining == 0:
+                    self.mode = "none"
+                return True
+            self.mode = "none"
+            return False
+        if self.mode == "nest":
+            cur_depth = len(session.get_binary_call_frames())
+            if cur_depth < self.nest_base_depth:
+                self.mode = "none"
+                return False
+            return cur_depth >= self.nest_base_depth + 1
+        return False
 
 
 class GdbSession(MIProtocol, GdbInspectorMixin):
@@ -67,6 +144,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         os.chmod(self.local_bin_host, 0o755)
 
         self.target_path_in_gdb = "/tmp/work/target_bin" if self.sandbox.enabled else str(self.local_bin_host)
+        self.stdin_path_in_gdb: str = ""
         self.reg_names: list[str] = []
         self.reg_name_to_idx: dict[str, int] = {}
         self.core_reg_indices: list[int] = []
@@ -74,6 +152,10 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         self.pc_reg_idx: int | None = None
         self.sp_reg_idx: int | None = None
         self._cached_stack_bounds: tuple[int, int, bool] | None = None
+        self._cached_functions: list[str] | None = None
+
+        self.ignore_mgr = IgnoreCallManager()
+        self.stdin_prompt_handler = None
 
         self.runtime_base: int | None = None
         self.exec_ranges: list[tuple[int, int]] = []
@@ -86,7 +168,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         self.qemu_port: int | None = None
 
     def start_gdb(self) -> None:
-        self.qemu_port = self.spawn_gdb_process(
+        self.qemu_port, self.stdin_path_in_gdb = self.spawn_gdb_process(
             sandbox=self.sandbox,
             work_dir=self.work_dir,
             gdb_bin=self.gdb_bin,
@@ -112,9 +194,11 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
                 raise RuntimeError(f"QEMU remote GDB connection failed: {res['payload'].get('msg')}")
             self.started = True
             self._discover_mappings()
-        elif self.target_args:
-            escaped = " ".join(shlex.quote(a) for a in self.target_args)
-            self.send(f"-exec-arguments {escaped}")
+        else:
+            escaped_args = " ".join(shlex.quote(a) for a in self.target_args)
+            redir = f"< {shlex.quote(self.stdin_path_in_gdb)}"
+            full_args = f"{escaped_args} {redir}".strip()
+            self.send(f"-exec-arguments {full_args}")
 
         self._load_register_names()
 
@@ -137,6 +221,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         self.exited = False
         self.exit_code = None
         self._cached_stack_bounds = None
+        self.drain_target_stdin()
         self.target_output_buffer.clear()
         res = self.send('-interpreter-exec console "starti"')
         stopped = res["stopped"]
@@ -184,6 +269,76 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
             return False, res["payload"].get("msg", f"Failed to break at {symbol}"), None
         stopped = self.run_or_continue()
         return True, f"Stopped at {symbol}", stopped
+
+    def run_to_next_call(self, raw_args: str) -> tuple[bool, str, dict | None]:
+        """
+        Parses `call <target> [--ignore]`.
+        1. Scans forward from PC in the current code for the first upcoming `call <target>`.
+           If found, runs to that call site and steps 1 instruction inside the callee.
+        2. If NOT visible ahead of PC:
+           - Without exact `--ignore`: errors immediately without running in the background.
+           - With exact `--ignore`: checks if <target> exists in the binary's own functions
+             and breaks/runs globally until reached (or errors immediately if non-existent).
+        """
+        tokens = raw_args.strip().split()
+        ignore_missing_in_view = False
+        filtered: list[str] = []
+        for tok in tokens:
+            if tok == "--ignore":
+                ignore_missing_in_view = True
+            else:
+                filtered.append(tok)
+
+        if not filtered:
+            return False, "Usage: call <function_name> [--ignore]", None
+
+        target_name = filtered[0]
+
+        if self.exited or not self.started:
+            self.started = False
+            self.advance_to_entry_point()
+
+        pc = self.get_pc()
+        if pc is None:
+            return False, "Cannot determine current PC.", None
+
+        match = self.find_upcoming_call(pc, target_name)
+        if match is not None:
+            call_addr, insn_text, is_plt = match
+            disp_call = self.to_display_addr(call_addr)
+            if call_addr != pc:
+                res = self.send(f"-break-insert -t *0x{call_addr:x}")
+                if res["status"] == "error":
+                    return False, res["payload"].get("msg", "Failed to set breakpoint on call"), None
+                stopped = self.run_or_continue()
+                if self.exited or self.get_pc() != call_addr:
+                    return True, f"Stopped before reaching call 0x{disp_call:x}", stopped
+            if is_plt and SKIP_EXTERNAL_FUNCTIONS:
+                return True, f"At external call 0x{disp_call:x} ({insn_text})", {"reason": "breakpoint-hit"}
+            stopped = self.step_instruction(1, step_over=False, respect_ignore_calls=False)
+            return True, f"Entered call `{target_name}` via 0x{disp_call:x}", stopped
+
+        if not ignore_missing_in_view:
+            return (
+                False,
+                f"Cannot see an upcoming call to '{target_name}' from here. Pass '--ignore' to search/run globally.",
+                None,
+            )
+
+        # `--ignore` passed: check only against this binary's own functions (never random libc functions)
+        bin_funcs = self.get_binary_functions()
+        low = target_name.lower()
+        sym_to_try = next((f for f in bin_funcs if f.lower() == low), None)
+        if sym_to_try is None:
+            sym_to_try = next((f for f in bin_funcs if f.lower().startswith(low)), None)
+        if sym_to_try is None:
+            sym_to_try = next((f for f in bin_funcs if low in f.lower()), None)
+
+        if sym_to_try and self.has_symbol(sym_to_try):
+            ok, msg, stopped = self.stop_at_symbol(sym_to_try)
+            return ok, f"Entered `{sym_to_try}` via --ignore ({msg})", stopped
+
+        return False, f"Function '{target_name}' does not exist in this binary.", None
 
     def goto_address(self, parsed_addr: int) -> tuple[bool, str, dict | None]:
         if self.exited or not self.started:
@@ -313,6 +468,39 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         bkpt = res["payload"].get("bkpt", {})
         return True, f"Breakpoint #{bkpt.get('number', '?')} set at {raw_symbol} ({bkpt.get('addr', '?')})"
 
+    def _interrupt_and_wait(self) -> dict | None:
+        self.send("-exec-interrupt")
+        stopped = self.wait_stopped(timeout=3.0)
+        if stopped:
+            self._on_stopped_record(stopped)
+        return stopped or {"reason": "interrupted"}
+
+    def _wait_stopped_interactive(self, initial_timeout: float = 0.7) -> dict | None:
+        try:
+            stopped = self.wait_stopped(timeout=initial_timeout)
+        except KeyboardInterrupt:
+            return self._interrupt_and_wait()
+
+        while stopped is None and self.stdin_prompt_handler is not None and not self.exited:
+            try:
+                user_in = self.stdin_prompt_handler(proactive=False)
+            except KeyboardInterrupt:
+                return self._interrupt_and_wait()
+            if user_in is None:
+                return self._interrupt_and_wait()
+            self.write_target_stdin(user_in)
+            try:
+                stopped = self.wait_stopped(timeout=2.5)
+            except KeyboardInterrupt:
+                return self._interrupt_and_wait()
+
+        if stopped is None and self.stdin_prompt_handler is None:
+            try:
+                stopped = self.wait_stopped(timeout=30.0)
+            except KeyboardInterrupt:
+                return self._interrupt_and_wait()
+        return stopped
+
     def run_or_continue(self, restart_if_exited: bool = False) -> dict | None:
         if self.exited:
             if not restart_if_exited:
@@ -325,7 +513,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         res = self.send("-exec-continue")
         if res["status"] == "error":
             return {"reason": "error", "msg": res["payload"].get("msg", "")}
-        stopped = res["stopped"] or self.wait_stopped(timeout=60.0)
+        stopped = res["stopped"] or self._wait_stopped_interactive(initial_timeout=0.7)
         if stopped:
             self._on_stopped_record(stopped)
         return stopped
@@ -335,7 +523,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         res = self.send(cmd)
         if res["status"] == "error":
             return {"reason": "error", "msg": res["payload"].get("msg", "")}
-        stopped = res["stopped"] or self.wait_stopped()
+        stopped = res["stopped"] or self._wait_stopped_interactive(initial_timeout=0.7)
         if stopped:
             self._on_stopped_record(stopped)
         return stopped
@@ -354,11 +542,26 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
                     return arg0
         return None
 
+    def _maybe_proactive_stdin(self, call_pc: int | None) -> bool:
+        if call_pc is None or self.stdin_prompt_handler is None or self.stdin_queued_lines > 0:
+            return True
+        insns = self.disassemble_at(call_pc, count=1)
+        if insns and _is_call_insn(insns[0][2]) and _looks_like_stdin_call(insns[0][2]):
+            try:
+                txt = self.stdin_prompt_handler(proactive=True)
+            except KeyboardInterrupt:
+                return False
+            if txt is None:
+                return False
+            self.write_target_stdin(txt)
+        return True
+
     def step_instruction(
         self,
         count: int = 1,
         step_over: bool = False,
         respect_skip_external: bool = True,
+        respect_ignore_calls: bool = True,
     ) -> dict | None:
         if self.exited:
             return {"reason": "exited", "exit-code": str(self.exit_code or 0)}
@@ -367,7 +570,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
 
         if step_over and count > 1:
             res = self.send(f'-interpreter-exec console "ni {count}"')
-            stopped = res["stopped"] or self.wait_stopped(timeout=30.0)
+            stopped = res["stopped"] or self._wait_stopped_interactive(initial_timeout=0.8)
             if stopped:
                 self._on_stopped_record(stopped)
             if not self.exited and respect_skip_external and SKIP_EXTERNAL_FUNCTIONS:
@@ -377,14 +580,23 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
             return stopped
 
         stopped = None
-        last_pc = self.get_pc() if (count == 1 or (respect_skip_external and SKIP_EXTERNAL_FUNCTIONS)) else None
+        last_pc = self.get_pc()
         for _ in range(count):
             prev_pc = last_pc
-            stopped = self._exec_single_step(step_over=step_over)
+            effective_step_over = step_over
+            if not effective_step_over and respect_ignore_calls and prev_pc is not None:
+                if self.ignore_mgr.should_skip_call_at_pc(self, prev_pc):
+                    effective_step_over = True
+
+            if effective_step_over:
+                if not self._maybe_proactive_stdin(prev_pc):
+                    return {"reason": "interrupted"}
+
+            stopped = self._exec_single_step(step_over=effective_step_over)
             if self.exited:
                 break
             reason = stopped.get("reason", "") if stopped else ""
-            if reason in ("breakpoint-hit", "signal-received", "syscall-entry", "syscall-return"):
+            if reason in ("breakpoint-hit", "signal-received", "syscall-entry", "syscall-return", "interrupted"):
                 break
             pc = _pc_from_stopped(stopped) or self.get_pc()
             if respect_skip_external and SKIP_EXTERNAL_FUNCTIONS:
@@ -392,7 +604,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
                     stopped = self.step_over_or_finish_external(
                         current_pc=pc,
                         from_pc=prev_pc,
-                        allow_callback_trap=(not step_over),
+                        allow_callback_trap=(not effective_step_over),
                     )
                     if self.exited:
                         break
@@ -408,7 +620,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         res = self.send("-exec-finish")
         if res["status"] == "error":
             return False, None, res["payload"].get("msg", "Cannot finish current frame.")
-        stopped = res["stopped"] or self.wait_stopped(timeout=30.0)
+        stopped = res["stopped"] or self._wait_stopped_interactive(initial_timeout=0.8)
         if stopped:
             self._on_stopped_record(stopped)
         if not self.exited and SKIP_EXTERNAL_FUNCTIONS:
@@ -432,6 +644,9 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
 
         used_plt_ret_bp = False
         if pc is not None and self.addr_in_plt(pc):
+            if not self._maybe_proactive_stdin(from_pc):
+                return {"reason": "interrupted"}
+
             ret_addr = None
             if self.elf.arch in ("x86_64", "i386"):
                 sp = self.get_sp()
@@ -452,7 +667,9 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
             if res["status"] == "error":
                 return self._exec_single_step(step_over=True)
 
-        stopped = res["stopped"] or self.wait_stopped(timeout=10.0)
+        stopped = res["stopped"] or (
+            self.wait_stopped(timeout=10.0) if on_syscall is not None else self._wait_stopped_interactive(initial_timeout=0.7)
+        )
         if stopped:
             self._on_stopped_record(stopped)
 

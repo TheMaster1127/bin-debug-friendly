@@ -139,7 +139,6 @@ class MIParser:
 
 
 def parse_mi_lines(line: str) -> list[tuple[str, str, object]]:
-    """Parses a single MI line, also splitting raw target stdout that lacks a trailing newline."""
     raw_line = line.rstrip("\r\n")
     if not raw_line:
         return []
@@ -165,7 +164,6 @@ def parse_mi_lines(line: str) -> list[tuple[str, str, object]]:
         except Exception:
             return [(prefix, cls, {"raw": body})]
 
-    # Target stdout without trailing newline might have an MI record glued onto it
     m = MI_EMBEDDED_RE.search(raw_line)
     if m and m.start() > 0:
         out_part = raw_line[:m.start()]
@@ -180,6 +178,50 @@ class MIProtocol:
         self.proc: subprocess.Popen | None = None
         self._read_buf = bytearray()
         self.target_output_buffer: list[str] = []
+        self.all_target_output: list[str] = []
+        self._stdin_fifo_host: Path | None = None
+        self._stdin_fifo_fd: int | None = None
+        self.stdin_queued_lines = 0
+
+    def _append_target_output(self, text: str) -> None:
+        self.target_output_buffer.append(text)
+        self.all_target_output.append(text)
+
+    def clear_target_output_history(self) -> None:
+        self.target_output_buffer.clear()
+        self.all_target_output.clear()
+
+    def get_all_target_stdout(self) -> str:
+        return "".join(self.all_target_output)
+
+    def setup_target_stdin_fifo(self, work_dir: Path, sandbox_enabled: bool) -> str:
+        self._stdin_fifo_host = work_dir / "target_stdin"
+        if not self._stdin_fifo_host.exists():
+            os.mkfifo(self._stdin_fifo_host)
+        self._stdin_fifo_fd = os.open(self._stdin_fifo_host, os.O_RDWR | os.O_NONBLOCK)
+        return "/tmp/work/target_stdin" if sandbox_enabled else str(self._stdin_fifo_host)
+
+    def write_target_stdin(self, text: str) -> None:
+        if self._stdin_fifo_fd is None:
+            return
+        payload = text if text.endswith("\n") else (text + "\n")
+        os.write(self._stdin_fifo_fd, payload.encode("utf-8", errors="replace"))
+        self.stdin_queued_lines += 1
+
+    def drain_target_stdin(self) -> None:
+        if self._stdin_fifo_fd is None:
+            return
+        self.stdin_queued_lines = 0
+        self.clear_target_output_history()
+        while True:
+            try:
+                chunk = os.read(self._stdin_fifo_fd, 4096)
+                if not chunk:
+                    break
+            except BlockingIOError:
+                break
+            except OSError:
+                break
 
     def spawn_gdb_process(
         self,
@@ -190,7 +232,8 @@ class MIProtocol:
         use_qemu: bool,
         qemu_bin: str | None,
         target_args: list[str],
-    ) -> int | None:
+    ) -> tuple[int | None, str]:
+        stdin_path_in_gdb = self.setup_target_stdin_fifo(work_dir, sandbox.enabled)
         qemu_port: int | None = None
         if use_qemu:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -201,7 +244,7 @@ class MIProtocol:
             wrapper = work_dir / "run_qemu_gdb.sh"
             wrapper_script = (
                 "#!/bin/sh\n"
-                f"{shlex.quote(qemu_bin)} -g {qemu_port} {shlex.quote(target_path_in_gdb)} {args_str} &\n"
+                f"{shlex.quote(qemu_bin)} -g {qemu_port} {shlex.quote(target_path_in_gdb)} {args_str} < {shlex.quote(stdin_path_in_gdb)} &\n"
                 "sleep 0.2\n"
                 f"exec {shlex.quote(gdb_bin)} --interpreter=mi2 -q {shlex.quote(target_path_in_gdb)}\n"
             )
@@ -225,9 +268,15 @@ class MIProtocol:
         )
         self._read_buf.clear()
         self._read_until_prompt()
-        return qemu_port
+        return qemu_port, stdin_path_in_gdb
 
     def close_process(self) -> None:
+        if self._stdin_fifo_fd is not None:
+            try:
+                os.close(self._stdin_fifo_fd)
+            except OSError:
+                pass
+            self._stdin_fifo_fd = None
         if self.proc:
             if self.proc.poll() is None:
                 try:
@@ -298,7 +347,7 @@ class MIProtocol:
                 break
             for kind, _cls, data in parse_mi_lines(line):
                 if kind in ("@", "raw"):
-                    self.target_output_buffer.append(str(data))
+                    self._append_target_output(str(data))
                 elif kind == "prompt":
                     return
 
@@ -324,7 +373,7 @@ class MIProtocol:
                 if kind == "~":
                     console_chunks.append(str(data))
                 elif kind in ("@", "raw"):
-                    self.target_output_buffer.append(str(data))
+                    self._append_target_output(str(data))
                 elif kind == "^":
                     status = cls
                     payload = data if isinstance(data, dict) else {}
@@ -351,7 +400,7 @@ class MIProtocol:
                 return None
             for kind, cls, data in parse_mi_lines(line):
                 if kind in ("@", "raw"):
-                    self.target_output_buffer.append(str(data))
+                    self._append_target_output(str(data))
                 elif kind == "*" and cls == "stopped":
                     stopped = data if isinstance(data, dict) else {}
                     self._on_stopped_record(stopped)

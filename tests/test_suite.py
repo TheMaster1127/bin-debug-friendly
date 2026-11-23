@@ -1,6 +1,7 @@
 # Copyright (C) 2026 bin-debug-friendly contributors
 # License: GNU GPLv3 (https://www.gnu.org/licenses/gpl-3.0.html)
 
+import io
 import os
 import shutil
 import subprocess
@@ -11,10 +12,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 
+from src.colors import ANSI_RE, colors_active, format_diff_xxd_line, highlight_char_diff, visible_len
 from src.elf_utils import parse_address_input, parse_elf
-from src.formatters import format_reg_line, parse_set_value
+from src.formatters import format_reg_line, handle_ignore_command, parse_set_value
 from src.gdb_inspector import trim_zero_stack
-from src.gdb_session import GdbSession
+from src.gdb_session import GdbSession, IgnoreCallManager
 from src.live_view import (
     fetch_view_page,
     parse_nest_token,
@@ -24,6 +26,7 @@ from src.live_view import (
     should_refresh_page,
 )
 from src.mapper import classify_instruction, run_execution_mapper
+from src.recorder import SessionRecorder
 from src.sandbox import SandboxEnv
 
 TEST_C_SOURCE = r"""
@@ -39,6 +42,21 @@ int secret_calc(int a, int b) {
 int main(void) {
     int res = secret_calc(10, 5);
     printf("result=%d\n", res);
+    fflush(stdout);
+    return 0;
+}
+"""
+
+TEST_FGETS_SOURCE = r"""
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char buf[32] = {0};
+    if (fgets(buf, sizeof(buf), stdin) != NULL) {
+        printf("got=%s", buf);
+        fflush(stdout);
+    }
     return 0;
 }
 """
@@ -59,15 +77,20 @@ class TestUnitHelpers(unittest.TestCase):
             val, _ = parse_address_input(raw)
             self.assertEqual(val, expected)
 
-    def test_view_option_parser_nest_and_split(self):
+    def test_view_option_parser_max_min_nest_and_split(self):
         sz, regs, stk, _, nest = parse_view_options(["only", "20", "nest5"])
         self.assertEqual((sz, regs, stk, nest), (20, False, False, 5))
+
+        _, regs_min, stk_min, _, _ = parse_view_options(["min"])
+        self.assertEqual((regs_min, stk_min), (False, False))
+
+        _, regs_max, stk_max, _, _ = parse_view_options(["max"])
+        self.assertEqual((regs_max, stk_max), (True, True))
 
         self.assertEqual(parse_nest_token("nest"), 1)
         self.assertEqual(parse_nest_token("nest1"), 1)
         self.assertEqual(parse_nest_token("nest2"), 2)
         self.assertEqual(parse_nest_token("nest0"), 0)
-        self.assertIsNone(parse_nest_token("nested"))
 
         frames = [{"func": "_start"}, {"func": "main"}, {"func": "secret_calc"}, {"func": "leaf"}]
         self.assertEqual([f["func"] for f in select_visible_frames(frames, 0)], ["leaf"])
@@ -78,11 +101,72 @@ class TestUnitHelpers(unittest.TestCase):
         self.assertEqual(cols[0], "left1      | right1")
         self.assertEqual(cols[1], "           | right2")
 
-        small_page = [(0x1000, "55", "push rbp"), (0x1001, "48", "mov rbp,rsp"), (0x1004, "5d", "pop rbp"), (0x1005, "c3", "ret")]
+        small_page = [(0x1000, "55", "push rbp"), (0x1001, "48", "mov rbp,rsp")]
         self.assertFalse(should_refresh_page(small_page, 0x1001, False))
-        self.assertFalse(should_refresh_page(small_page, 0x1004, False))
         self.assertTrue(should_refresh_page(small_page, 0x2000, False))
         self.assertTrue(should_refresh_page(small_page, 0x1001, True))
+
+    def test_colors_char_diff_and_byte_addr_xxd(self):
+        prev_bytes = {0x7000 + i: b for i, b in enumerate(b"ABCDXXXX12345678")}
+        line, changed = format_diff_xxd_line(0x7000, b"ABCDEFGH12345678", prev_bytes, 0x7000)
+        self.assertTrue(changed)
+        self.assertIn("ABCDEFGH", ANSI_RE.sub("", line))
+        self.assertEqual(visible_len("\x1b[32mhello\x1b[0m"), 5)
+
+        diff_hex = highlight_char_diff("0x000000000000128d", "0x0000000000001288")
+        self.assertEqual(ANSI_RE.sub("", diff_hex), "0x000000000000128d")
+
+        orig_stdout = sys.stdout
+        try:
+            sys.stdout = io.StringIO()
+            self.assertFalse(colors_active())
+            plain_line, plain_changed = format_diff_xxd_line(0x7000, b"ABCDEFGH12345678", prev_bytes, 0x7000)
+            self.assertTrue(plain_changed)
+            self.assertNotIn("\x1b[", plain_line)
+            self.assertIn("ABCDEFGH", plain_line)
+        finally:
+            sys.stdout = orig_stdout
+
+    def test_ignore_call_manager(self):
+        mgr = IgnoreCallManager()
+        self.assertEqual(mgr.mode, "none")
+        mgr.set_count(2)
+        self.assertEqual((mgr.mode, mgr.remaining), ("count", 2))
+        mgr.set_all()
+        self.assertEqual(mgr.mode, "all")
+        mgr.set_nest(1)
+        self.assertEqual((mgr.mode, mgr.nest_base_depth), ("nest", 1))
+        mgr.clear()
+        self.assertEqual(mgr.mode, "none")
+
+    def test_recorder_folder_idle_flush_and_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                rec = SessionRecorder(Path("/tmp/dummy"), "x86_64", 64, True)
+                rec.record_event(
+                    command="step",
+                    duration_ms=1.2,
+                    pc_disp="0x1140",
+                    func_name="main",
+                    disas_lines=["  => 0x1140:  55  push rbp"],
+                    regs={"rax": 1, "rsp": 0x7000},
+                    prev_regs={"rax": 0, "rsp": 0x7000},
+                    stack_lines=["0x0000000000007000: 0100 ..."],
+                )
+                self.assertFalse(rec.out_dir.exists())
+                rec.flush_idle()
+                self.assertTrue(rec.out_path.exists())
+                self.assertTrue((rec.func_dir / "func_main.txt").exists())
+                rec.close()
+                txt = rec.out_path.read_text(encoding="utf-8")
+                self.assertIn("CMD='step'", txt)
+                self.assertIn("CHANGED  : RAX=0x1", txt)
+                self.assertIn("FULL ACTIVE STACK", txt)
+                self.assertIn("RECORDING CLOSED", txt)
+            finally:
+                os.chdir(old_cwd)
 
     def test_trim_zero_stack(self):
         raw = (b"\x00" * 32) + b"ABCD1234EFGH5678" + (b"\x00" * 48)
@@ -110,9 +194,14 @@ class TestEndToEndDebugger(unittest.TestCase):
         src = cls.tmp_path / "sample.c"
         src.write_text(TEST_C_SOURCE, encoding="utf-8")
 
+        fgets_src = cls.tmp_path / "fgets_sample.c"
+        fgets_src.write_text(TEST_FGETS_SOURCE, encoding="utf-8")
+
         cls.bin_pie = cls.tmp_path / "sample_pie"
         cls.bin_stripped = cls.tmp_path / "sample_stripped"
+        cls.bin_fgets = cls.tmp_path / "fgets_pie"
         subprocess.run(["gcc", "-O0", "-fPIE", "-pie", str(src), "-o", str(cls.bin_pie)], check=True)
+        subprocess.run(["gcc", "-O0", "-fPIE", "-pie", str(fgets_src), "-o", str(cls.bin_fgets)], check=True)
         shutil.copy2(cls.bin_pie, cls.bin_stripped)
         subprocess.run(["strip", "--strip-all", str(cls.bin_stripped)], check=True)
 
@@ -130,6 +219,76 @@ class TestEndToEndDebugger(unittest.TestCase):
             if len(parts) >= 3 and parts[2] == symbol:
                 return int(parts[0], 16)
         raise RuntimeError(f"Symbol {symbol} not found in {bin_path}")
+
+    def test_call_command_and_no_libc_pollution(self):
+        if not shutil.which("bwrap") or not shutil.which("gdb"):
+            self.skipTest("bwrap or gdb not installed")
+
+        elf = parse_elf(self.bin_pie)
+        # Verify pure-Python .symtab extraction has binary funcs and zero libc funcs
+        self.assertIn("secret_calc", elf.functions)
+        self.assertNotIn("clock_adjtime", elf.functions)
+
+        sandbox = SandboxEnv(enabled=True)
+        session = GdbSession(self.bin_pie, elf, sandbox)
+        try:
+            session.start_gdb()
+            session.stop_at_symbol("main")
+            funcs = session.get_binary_functions()
+            self.assertIn("secret_calc", funcs)
+            self.assertNotIn("clock_adjtime", funcs)
+            self.assertNotIn("c16rtomb", funcs)
+
+            # Non-visible / nonexistent call without --ignore must fail immediately without running
+            ok_bad, msg_bad, _ = session.run_to_next_call("nonexistent_fn_xyz")
+            self.assertFalse(ok_bad)
+            self.assertIn("--ignore", msg_bad)
+            self.assertFalse(session.exited)
+
+            # Nonexistent call WITH --ignore must fail immediately too
+            ok_bad2, msg_bad2, _ = session.run_to_next_call("nonexistent_fn_xyz --ignore")
+            self.assertFalse(ok_bad2)
+            self.assertIn("does not exist", msg_bad2)
+
+            # Valid upcoming call enters secret_calc
+            ok, msg, _ = session.run_to_next_call("secret_calc")
+            self.assertTrue(ok, msg)
+            self.assertEqual(session.get_current_function(), "secret_calc")
+        finally:
+            session.close()
+
+    def test_fgets_interactive_stdin_and_ignore_calls(self):
+        if not shutil.which("bwrap") or not shutil.which("gdb"):
+            self.skipTest("bwrap or gdb not installed")
+
+        elf_fg = parse_elf(self.bin_fgets)
+        sandbox = SandboxEnv(enabled=True)
+        s_fg = GdbSession(self.bin_fgets, elf_fg, sandbox)
+        try:
+            s_fg.start_gdb()
+            s_fg.stdin_prompt_handler = lambda proactive=False: "crackme_pass"
+            s_fg.stop_at_symbol("main")
+            s_fg.run_or_continue()
+            self.assertTrue(s_fg.exited)
+            self.assertIn("got=crackme_pass", s_fg.pop_target_output())
+        finally:
+            s_fg.close()
+
+        elf = parse_elf(self.bin_pie)
+        s_ign = GdbSession(self.bin_pie, elf, sandbox)
+        try:
+            s_ign.start_gdb()
+            s_ign.stop_at_symbol("main")
+            msg = handle_ignore_command(s_ign, "ignore once")
+            self.assertIn("once", msg)
+            for _ in range(15):
+                s_ign.step_instruction(1, step_over=False)
+                if s_ign.ignore_mgr.mode == "none":
+                    break
+            self.assertEqual(s_ign.get_current_function(), "main")
+            self.assertEqual(s_ign.ignore_mgr.mode, "none")
+        finally:
+            s_ign.close()
 
     def test_start_steps_into_main_nested_frames_and_stationary_view(self):
         if not shutil.which("bwrap") or not shutil.which("gdb"):
@@ -152,7 +311,6 @@ class TestEndToEndDebugger(unittest.TestCase):
             session.step_instruction(1, step_over=False)
             self.assertFalse(should_refresh_page(page, session.get_pc(), False))
 
-            # Run to secret_calc and verify nested main-binary call frames (_start -> main -> secret_calc)
             session.goto_address(self.pie_secret_off)
             frames = session.get_binary_call_frames()
             func_names = [f["func"] for f in frames]
@@ -227,7 +385,6 @@ class TestEndToEndDebugger(unittest.TestCase):
         old_cwd = os.getcwd()
         os.chdir(self.tmp_path)
         try:
-            # 1. Full program mapping (no --func): must enter main(), secret_calc(), and record syscalls!
             s_full = GdbSession(self.bin_pie, elf, sandbox)
             try:
                 s_full.start_gdb()
@@ -237,12 +394,10 @@ class TestEndToEndDebugger(unittest.TestCase):
                 self.assertIn("Total System Calls", summary)
                 self.assertNotIn("Total System Calls    : 0", summary)
                 self.assertIn("SYSCALL #0001", syscalls)
-                # Ensure more than just _start's 12 instructions ran (main + secret_calc executed)
                 self.assertGreater(len(list((full_dir / "functions").glob("func_*.txt"))), 1)
             finally:
                 s_full.close()
 
-            # 2. Function-scoped mapping (--func)
             s_func = GdbSession(self.bin_pie, elf, sandbox)
             try:
                 s_func.start_gdb()

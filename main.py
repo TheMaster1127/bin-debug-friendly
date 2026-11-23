@@ -15,6 +15,7 @@ from src.cli import run_interactive_cli
 from src.elf_utils import parse_elf
 from src.gdb_session import GdbSession
 from src.mapper import run_execution_mapper
+from src.recorder import SessionRecorder
 from src.sandbox import SandboxEnv, confirm_disable_sandbox
 
 
@@ -34,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="start_at_main",
         action="store_true",
         help="Start and stop at main() (errors out if no main symbol exists)",
+    )
+    parser.add_argument(
+        "-record", "--record",
+        dest="record_session",
+        action="store_true",
+        help="Record interactive session into record-<bin>_<date>/ folder",
     )
     parser.add_argument(
         "-map", "--map",
@@ -91,6 +98,12 @@ def main() -> None:
         target_args=args.target_args,
     )
 
+    recorder = (
+        SessionRecorder(bin_path, elf.arch, elf.bits, elf.is_pie)
+        if args.record_session and not args.map_exec
+        else None
+    )
+
     try:
         session.start_gdb()
         if args.map_exec:
@@ -109,8 +122,11 @@ def main() -> None:
                     )
             else:
                 session.advance_to_entry_point()
-            run_interactive_cli(session)
+            run_interactive_cli(session, recorder=recorder)
     finally:
+        if recorder is not None:
+            recorder.close()
+            print(f"[+] Recording saved -> {recorder.out_dir}/")
         session.close()
 
 

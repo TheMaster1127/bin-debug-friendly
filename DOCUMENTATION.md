@@ -1,191 +1,228 @@
-# bin-debug-friendly — Technical Documentation & Architecture Specification
+# `bin-debug-friendly` — Technical Documentation & Design Specification
 
-> **Scope:** Complete internal design, module breakdown, unbuffered GDB/MI2 protocol engine, pure-Python ELF32/ELF64 & PIE address resolver, external-library skipping mechanics, stationary live-view renderer, execution mapper, and Bubblewrap sandbox isolation.
+> **Document Scope:** Complete architectural specification, design rationale, module-by-module internals, pure-Python ELF32/ELF64 & PIE address resolution, GDB/MI2 pipe & FIFO isolation, indexed register caching, external call skipping & `IgnoreCallManager`, stationary ANSI live-view rendering, session recording format, execution mapping protocol, and Bubblewrap/QEMU sandboxing.
 
 ---
 
 ## Table of Contents
-1. [Architectural Overview & Module Map](#1-architectural-overview--module-map)
-2. [Pure-Python ELF Parser & Exact Address Resolution](#2-pure-python-elf-parser--exact-address-resolution)
-3. [Unbuffered GDB/MI2 Protocol Engine (`src/mi_protocol.py`)](#3-unbuffered-gdbmi2-protocol-engine-srcmi_protocolpy)
-4. [High-Speed Register, Memory & Disassembly Inspection (`src/gdb_inspector.py`)](#4-high-speed-register-memory--disassembly-inspection-srcgdb_inspectorspy)
-5. [Execution Control, PLT Skipping & Callback Trapping (`src/gdb_session.py`)](#5-execution-control-plt-skipping--callback-trapping-srcgdb_sessionpy)
-6. [Stationary Live View, Split Layout & Call Nesting (`src/live_view.py`)](#6-stationary-live-view-split-layout--call-nesting-srclive_viewpy)
-7. [Zero-Trimmed Stack Inspection & Binary Dumping](#7-zero-trimmed-stack-inspection--binary-dumping)
-8. [Execution Mapping & Syscall Tracing (`src/mapper.py`)](#8-execution-mapping--syscall-tracing-srcmapperpy)
-9. [Bubblewrap Sandboxing & QEMU Cross-Arch Architecture (`src/sandbox.py`)](#9-bubblewrap-sandboxing--qemu-cross-arch-architecture-srcsandboxpy)
-10. [Engineering Post-Mortem: Bugs Solved & Performance Optimizations](#10-engineering-post-mortem-bugs-solved--performance-optimizations)
+
+1. [Design Philosophy: Why `bin-debug-friendly` Exists](#1-design-philosophy-why-bin-debug-friendly-exists)
+2. [System Architecture & Module Dependency Graph](#2-system-architecture--module-dependency-graph)
+3. [Module-by-Module Technical Reference](#3-module-by-module-technical-reference)
+4. [Pure-Python ELF32/ELF64 Parser & PIE Address Translation (`src/elf_utils.py`)](#4-pure-python-elf32elf64-parser--pie-address-translation-srcelf_utilspy)
+5. [Unbuffered GDB/MI2 Transport & Isolated `stdin`/`stdout` (`src/mi_protocol.py`)](#5-unbuffered-gdbmi2-transport--isolated-stdinstdout-srcmi_protocolpy)
+6. [High-Speed Register, Memory & Disassembly Engine (`src/gdb_inspector.py`)](#6-high-speed-register-memory--disassembly-engine-srcgdb_inspectorpy)
+7. [Execution Control, External Skipping, `call` & `ignore` (`src/gdb_session.py`)](#7-execution-control-external-skipping-call--ignore-srcgdb_sessionpy)
+8. [Stationary Live View, Split Layout, `nestN` & Color Diffs (`src/live_view.py`, `src/colors.py`)](#8-stationary-live-view-split-layout-nestn--color-diffs-srclive_viewpy-srccolorspy)
+9. [Zero-Trimmed Stack Inspection & Binary Dumping](#9-zero-trimmed-stack-inspection--binary-dumping)
+10. [Session Recording Specification (`src/recorder.py`)](#10-session-recording-specification-srcrecorderpy)
+11. [Autonomous Execution Mapping & Syscall Tracing (`src/mapper.py`)](#11-autonomous-execution-mapping--syscall-tracing-srcmapperpy)
+12. [Bubblewrap Sandbox & Cross-Architecture QEMU Design (`src/sandbox.py`)](#12-bubblewrap-sandbox--cross-architecture-qemu-design-srcsandboxpy)
+13. [Configuration Reference (`src/config.py`)](#13-configuration-reference-srcconfigpy)
 
 ---
 
-## 1. Architectural Overview & Module Map
+## 1. Design Philosophy: Why `bin-debug-friendly` Exists
+
+Raw GDB is built for source-level C/C++ debugging with full DWARF symbols. When reverse-engineering stripped binaries, crackmes, or compiled C/Rust targets without source code, standard GDB introduces constant friction:
+
+1. **Address Disconnect:** Disassemblers (`objdump`, `binpatch`, `readelf`) show static offsets (`0x1149`) or fixed VMAs (`0x401149`), whereas PIE binaries relocate at runtime (`0x555555555149`). Translating between static offsets and live runtime addresses should be automatic, never manual.
+2. **Loader & Shared Library Noise:** Single-stepping through `_start` or `call printf@plt` normally pulls the analyst into `ld-linux.so`, GOT/PLT resolution trampolines, and `libc` internals—while still needing to stop cleanly at `main()` or user callbacks invoked from `libc`.
+3. **Scroll Blindness:** Traditional CLI debuggers scroll past previous disassembly, register values, and stack bytes on every step, hiding *what changed* between instruction $i$ and instruction $i+1$.
+4. **Unsafe Execution:** Running untrusted or unknown ELF binaries directly on a developer workstation exposes `/home`, SSH keys, and the network stack. Debugging should be air-gapped inside Linux namespaces by default.
+5. **Post-Session Traceability:** Analysts and AI workflows need structured, non-JSON, deterministic execution maps (`--map`) and interactive session recordings (`--record`) without slowing down interactive stepping.
+
+`bin-debug-friendly` achieves all of this using **Python 3 standard library modules only** (zero mandatory `pip` packages), GNU `gdb --interpreter=mi2`, `bubblewrap`, and optional `qemu-user` / `colorama`.
+
+---
+
+## 2. System Architecture & Module Dependency Graph
 
 ```text
-                        ┌───────────────────────────────┐
-                        │            main.py            │
-                        │  CLI Flags (-m, -map, -func)  │
-                        └───────────────┬───────────────┘
-                                        │
-                 ┌──────────────────────┴──────────────────────┐
-                 ▼                                             ▼
-┌─────────────────────────────────┐           ┌─────────────────────────────────┐
-│     Interactive Frontend        │           │     Execution Mapper Mode       │
-│  • src/cli.py (REPL & ls/dump)  │           │  • src/mapper.py                │
-│  • src/live_view.py (TUI/nestN) │           │    - Instruction & Reg Trace    │
-│  • src/formatters.py (Intel/hex)│           │    - Syscall Catch & Stats      │
-└────────────────┬────────────────┘           │    - 250 MB Size Guard          │
-                 │                            └────────────────┬────────────────┘
-                 └──────────────────────┬──────────────────────┘
-                                        ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         GDB Session Layer (3 Modules)                        │
-│  • src/gdb_session.py   — Breakpoints, PIE/PLT skip, callback traps, jump   │
-│  • src/gdb_inspector.py — Indexed GPRs, .text disas, call frames, stack dump│
-│  • src/mi_protocol.py   — Unbuffered binary pipe I/O + MI2 recursive parser  │
-└────────────────┬─────────────────────────────────────┬───────────────────────┘
-                 ▼                                     ▼
-┌─────────────────────────────────┐   ┌────────────────────────────────────────┐
-│       src/elf_utils.py          │   │           src/sandbox.py               │
-│  • ELF32/ELF64 Header & PT_LOAD │   │  • Bubblewrap (--unshare-all)          │
-│  • .text & .plt* Section Bounds │   │  • QEMU user-mode (-g <port>) + GDB    │
-│  • Flexible Hex & PIE Resolver  │   │  • Multi-step --no-sandbox Gate        │
-└─────────────────────────────────┘   └────────────────────────────────────────┘
+                        ┌─────────────────────────────────┐
+                        │             main.py             │
+                        │ CLI Entry (-m, -record, -map)   │
+                        └────────────────┬────────────────┘
+                                         │
+                 ┌───────────────────────┴───────────────────────┐
+                 ▼                                               ▼
+┌─────────────────────────────────┐             ┌─────────────────────────────────┐
+│     Interactive Frontend        │             │     Execution Mapper Mode       │
+│  • src/cli.py (REPL, ls, dump)  │             │  • src/mapper.py                │
+│  • src/live_view.py (TUI/nestN) │             │    - Instruction & Reg Trace    │
+│  • src/formatters.py (Intel/hex)│             │    - Syscall Catch & Stats      │
+│  • src/colors.py (TTY green)    │             │    - 250 MB Size Guard          │
+│  • src/recorder.py (--record)   │             └────────────────┬────────────────┘
+└────────────────┬────────────────┘                              │
+                 └───────────────────────┬───────────────────────┘
+                                         ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          GDB Session Layer (3 Modules)                          │
+│  • src/gdb_session.py   — Breakpoints, PIE/PLT skip, IgnoreCallMgr, call <fn>   │
+│  • src/gdb_inspector.py — Indexed GPRs, .text disas, call frames, stack dumps   │
+│  • src/mi_protocol.py   — Unbuffered binary pipe I/O, FIFO stdin, MI2 parser    │
+└────────────────┬───────────────────────────────────────┬────────────────────────┘
+                 ▼                                       ▼
+┌─────────────────────────────────┐     ┌─────────────────────────────────────────┐
+│       src/elf_utils.py          │     │            src/sandbox.py               │
+│  • ELF32/ELF64 Header & PT_LOAD │     │  • Bubblewrap (--unshare-all)           │
+│  • .text, .plt*, .symtab Bounds │     │  • QEMU user-mode (-g <port>) + GDB     │
+│  • Flexible Hex & PIE Resolver  │     │  • Multi-step --no-sandbox Gate         │
+└─────────────────────────────────┘     └─────────────────────────────────────────┘
 ```
 
-### Source Files Summary
-| File | Responsibility |
-| :--- | :--- |
-| `main.py` | Argument parsing, ELF verification, sandbox confirmation, mode dispatch (`_start` vs `-m` vs `--map`). |
-| `src/config.py` | Centralized user configuration (formats, prompt flags, `VIEW_PAGE_SIZE`, `SKIP_EXTERNAL_FUNCTIONS`, `MAX_MAP_FOLDER_MB`). |
-| `src/elf_utils.py` | Pure-Python ELF32/ELF64 parser, section extractor (`.text`, `.plt*`), flexible address parser, PIE rebase logic. |
-| `src/sandbox.py` | Host/target architecture detection, `bwrap` command builder, startup self-test, `--no-sandbox` multi-step gate. |
-| `src/mi_protocol.py` | Recursive-descent GDB/MI2 parser, `select()` + `os.read()` unbuffered pipe I/O, raw target stdout splitting. |
-| `src/gdb_inspector.py` | Fast indexed register queries, memory/C-string reading, Intel opcode disassembly, `ls` context, stack bounds & zero trimming. |
-| `src/gdb_session.py` | Process start/restart, PIE runtime base discovery, `goto_address`, `jump_to_target`, `skip_function`, PLT/external skipping. |
-| `src/formatters.py` | Aligned register formatting, `xxd`-style stack formatter, prompt builder, `objdump`-style disassembly lines. |
-| `src/live_view.py` | Stationary ANSI live view, dynamic `nestN` caller/callee windows, wide-screen split columns, `*` change highlights. |
-| `src/cli.py` | Interactive REPL (`ls`, `0x...`, `jump`, `step/next N dump`, `info stack`, `stack less`, `dump stack`, `maps`). |
-| `src/mapper.py` | Non-interactive execution tracer producing European-dated folders (`full_trace.txt`, `syscalls_trace.txt`, `summary.txt`, `functions/`). |
+---
+
+## 3. Module-by-Module Technical Reference
+
+| Module | Primary Role | Key Exports |
+|--------|--------------|-------------|
+| `main.py` | CLI entry point, ELF validation, `--no-sandbox` gate, session/recorder lifecycle. | `build_parser()`, `main()` |
+| `src/config.py` | User-editable defaults for display, stepping, recording, and mapping caps. | `VIEW_PAGE_SIZE`, `MAX_MAP_FOLDER_MB`, etc. |
+| `src/elf_utils.py` | Zero-dependency ELF32/ELF64 binary & symbol parser and address translator. | `ElfInfo`, `parse_elf()`, `parse_address_input()`, `resolve_target_address()` |
+| `src/sandbox.py` | Architecture matching, `bwrap` container builder, QEMU detection, host confirmation. | `SandboxEnv`, `confirm_disable_sandbox()`, `detect_host_arch()`, `needs_qemu()` |
+| `src/mi_protocol.py` | Raw `bufsize=0` GDB/MI2 pipe driver, recursive MI2 parser, target `stdin` FIFO. | `MIProtocol`, `MIParser`, `parse_mi_lines()` |
+| `src/gdb_inspector.py` | Fast indexed register queries, memory/C-string inspection, Intel disassembly, stack bounds. | `GdbInspectorMixin`, `trim_zero_stack()`, `CORE_REGS` |
+| `src/gdb_session.py` | Execution orchestration, PIE base discovery, `call`, `jump`, `ignore`, external skipping. | `GdbSession`, `IgnoreCallManager` |
+| `src/formatters.py` | Register/stack/disas formatters, prompt generator, `readline` Tab completer, `help`. | `format_reg_line()`, `setup_readline_completer()`, `handle_ignore_command()` |
+| `src/colors.py` | Optional `colorama` TTY-only highlighting, ANSI-aware padding, byte-level stack diffs. | `colors_active()`, `highlight_char_diff()`, `format_diff_xxd_line()`, `visible_len()` |
+| `src/live_view.py` | Flicker-free single-flush live dashboard, wide-screen split layout, `nestN` panes. | `run_live_view()`, `parse_view_options()`, `select_visible_frames()` |
+| `src/cli.py` | Interactive REPL loop, `ls`/`lsN`, batch step-dumping, stack preview/less/dump. | `run_interactive_cli()`, `handle_ls_command()`, `handle_step_with_dump()` |
+| `src/recorder.py` | Idle-flushed session recorder writing full active stack & per-function logs. | `SessionRecorder` |
+| `src/mapper.py` | Autonomous execution & syscall mapper with 250 MB size cap and European timestamps. | `run_execution_mapper()`, `classify_instruction()`, `FolderSizeGuard` |
 
 ---
 
-## 2. Pure-Python ELF Parser & Exact Address Resolution
+## 4. Pure-Python ELF32/ELF64 Parser & PIE Address Translation (`src/elf_utils.py`)
 
-### Header, Segment & Section Extraction (`src/elf_utils.py`)
-`parse_elf()` parses raw bytes directly with `struct.unpack` (no `readelf` or `objdump` subprocess calls):
-1. Validates `\x7fELF`, extracts `EI_CLASS` (32/64-bit) and `EI_DATA` (`<` little / `>` big endian).
-2. Identifies `e_machine` (`x86_64`, `i386`, `aarch64`, `arm`) and `e_type` (`ET_EXEC` = fixed address, `ET_DYN` = PIE).
-3. Parses all `PT_LOAD` program headers (`LoadSegment`) to compute `base_vaddr` and file-offset-to-vaddr mappings.
-4. Parses `.shstrtab` and all section headers to extract exact runtime-rebasable bounds for:
-   - **`.text`** (`text_range`): ensures `ls` and `disas` stop at the true end of code instead of disassembling trailing page `0x00` padding as `add BYTE PTR [rax], al`.
-   - **`.plt*`** (`.plt`, `.plt.sec`, `.plt.got`): distinguishes external dynamic-linker trampolines inside the binary from actual user `.text` code.
+`parse_elf()` parses binary headers directly via `struct.unpack` without spawning `readelf` or `objdump`:
 
-### Flexible Address Parsing & PIE Rebasing
-`parse_address_input()` strips surrounding quotes and all internal/external whitespace, accepting `0x1149`, `1149`, `" 0x 40 11 49 "`, and `0X1149` identically.
-
-When debugging a PIE binary (`ET_DYN`):
-1. `ensure_started_paused()` executes `starti`, at which point the Linux kernel has already mapped both `ld.so` and the main executable into virtual memory.
-2. `_discover_mappings()` inspects `info proc mappings` (falling back to `info auxv` `AT_PHDR - e_phoff` or `AT_ENTRY - e_entry` when under QEMU user-mode) to obtain the exact `runtime_base` (e.g., `0x555555554000`).
-3. `resolve_target_address()` converts any user address:
-   - Already in runtime range (`>= runtime_base`) $\rightarrow$ used directly.
-   - An ELF virtual address (`elf.contains_vaddr(addr)`) $\rightarrow$ `runtime_base + (addr - elf.base_vaddr)`.
-   - A raw file offset (`elf.file_offset_to_vaddr(addr)`) $\rightarrow$ `runtime_base + (vaddr - elf.base_vaddr)`.
-4. `to_display_addr()` and `rebase_disas_text()` perform the inverse conversion when `USE_OBJDUMP_ADDR = True`, displaying `0x1149` and `# 0x2004` / `call 0x1030 <puts@plt>` exactly like `objdump`.
+1. **Header & Architecture Detection:**
+   - Verifies `\x7fELF`, reads `EI_CLASS` (`ELFCLASS32` / `ELFCLASS64`), `EI_DATA` (`<` little-endian / `>` big-endian), `e_machine` (`EM_X86_64`, `EM_386`, `EM_AARCH64`, `EM_ARM`), and `e_type` (`ET_EXEC` vs `ET_DYN`).
+2. **Segment Mapping (`PT_LOAD`):**
+   - Stores all `LoadSegment` entries (`vaddr`, `memsz`, `offset`, `filesz`, `flags`) and computes `base_vaddr = min(seg.vaddr)`.
+   - Provides `contains_vaddr()` and `file_offset_to_vaddr()` so raw file offsets copied from `xxd` or a hex editor map directly to their virtual address.
+3. **Section Extraction (`.text`, `.plt*`, `.symtab`):**
+   - **`.text` (`text_range`):** Clamps `ls` and `disas` forward disassembly to the actual end of executable code, avoiding trailing page `0x00` padding.
+   - **`.plt*` (`plt_ranges`):** Identifies `.plt`, `.plt.sec`, and `.plt.got` stubs inside the executable so stepping treats them as external library trampolines rather than user code.
+   - **`.symtab` / `.strtab` (`functions`):** Extracts `STT_FUNC` symbols belonging strictly to the target binary (`user_fns` sorted first, internal `_` symbols second), keeping `Tab` autocompletion fast and free of `libc` symbols.
+4. **PIE Runtime Rebasing (`resolve_target_address`):**
+   - If `elf.is_pie` is `True`:
+     - Addresses `>= runtime_base` inside mapped segments are used directly as live runtime addresses.
+     - Addresses inside `elf.segments` (`objdump` offsets) resolve to `runtime_base + (addr - elf.base_vaddr)`.
+     - Raw file offsets resolve via `file_offset_to_vaddr(addr)` then rebase from `runtime_base`.
+   - When displaying addresses (`to_display_addr` and `rebase_disas_text`), live addresses inside the binary convert back to `objdump`-style offsets whenever `USE_OBJDUMP_ADDR = True`.
 
 ---
 
-## 3. Unbuffered GDB/MI2 Protocol Engine (`src/mi_protocol.py`)
+## 5. Unbuffered GDB/MI2 Transport & Isolated `stdin`/`stdout` (`src/mi_protocol.py`)
 
-### Why Unbuffered Binary Pipes (`bufsize=0`)?
-Python's `TextIOWrapper` (`text=True, bufsize=1`) reads ahead into an internal user-space buffer. Calling `select.select([fd])` before `readline()` deadlocks whenever `(gdb) ` is already buffered inside `TextIOWrapper` while the kernel pipe is empty.
+### Unbuffered Binary Pipe I/O
+`MIProtocol` launches GDB with `bufsize=0` (raw unbuffered OS pipes) and manages its own `self._read_buf = bytearray()`. `_readline_timeout()` always checks `self._read_buf.find(b"\n")` before calling `select.select([fd])` and `os.read(fd, 4096)`, guaranteeing non-blocking timeouts with zero buffering deadlocks.
 
-`MIProtocol` avoids this permanently:
-* Spawns GDB with `bufsize=0` (raw unbuffered `FileIO`).
-* Maintains an explicit `self._read_buf = bytearray()`.
-* `_readline_timeout()` checks `self._read_buf.find(b"\n")` **first**, and only calls `select.select([fd])` + `os.read(fd, 4096)` when no complete line is buffered.
+### Recursive-Descent MI2 Parser (`MIParser`)
+Handles GDB/MI2 async records (`*stopped`, `=thread-*`), result records (`^done`, `^running`, `^error`), console streams (`~"..."`), target streams (`@"..."`), nested tuples (`{...}`), lists (`[...]`), and escaped C-strings.
 
-### Capturing Target Stdout Without a PTY
-When GDB runs without a dedicated PTY (`--tty`), the target writes directly to the shared stdout pipe as raw lines rather than `@"..."` MI async packets. `parse_mi_lines()` captures all `raw` lines into `target_output_buffer` and uses `MI_EMBEDDED_RE` to cleanly split target output that lacks a trailing `\n` when followed immediately by `*stopped`, `^done`, or `=thread-*`.
-
----
-
-## 4. High-Speed Register, Memory & Disassembly Inspection (`src/gdb_inspector.py`)
-
-### Indexed Register Queries (Avoiding 150-Register AVX-512 Overhead)
-On modern x86-64 CPUs, `-data-list-register-values x` dumps 150+ registers (`zmm0..zmm31`, `ymm`, `xmm`, `st0..st7`, `mxcsr`) totaling ~10 KB per call.
-
-During `_load_register_names()`:
-* `GdbInspectorMixin` maps the 18 core architecture registers (`CORE_REGS`) to their integer GDB register indices (`core_reg_query = "0 1 2 ... 17"`), plus `pc_reg_idx` and `sp_reg_idx`.
-* `get_registers()` queries **only those 18 indices**.
-* `get_pc()` and `get_sp()` query **only 1 register index** (and `step_instruction()` extracts `PC` directly from `*stopped["frame"]["addr"]` at **0 extra GDB calls**).
-
-### Disassembly & `ls` Synchronization
-`disassemble_range()` requests MI mode `2` (`-- 2`) to fetch raw hex `opcodes` alongside Intel `inst` mnemonics.  
-For `ls [N]` / `lsN`, `disassemble_context()` anchors at the current function's start address (or `_start` if near entry) before slicing `[pc_idx - before : pc_idx + after + 1]` within `.text` bounds, avoiding x86 variable-length byte desynchronization and preventing trailing zero-page disassembly.
+### Target `stdout` & `stdin` Isolation
+- **Target `stdout`:** In pipe mode without a PTY, GDB emits target `stdout` as `raw` lines alongside MI records. `parse_mi_lines()` captures both `@"..."` and `raw` lines into `target_output_buffer` (for per-step display) and `all_target_output` (retained across the full run for `EXITED` screens), splitting any target output lacking a trailing `\n` via `MI_EMBEDDED_RE`.
+- **Target `stdin` FIFO:** `setup_target_stdin_fifo()` creates a named pipe in `work_dir` (`/tmp/work/target_stdin` inside Bubblewrap), opened `O_RDWR | O_NONBLOCK` on the host so Python keeps a writer open without blocking and feeds lines cleanly to `fgets`/`scanf`/`read(0)` via `-exec-arguments ... < /tmp/work/target_stdin`.
 
 ---
 
-## 5. Execution Control, PLT Skipping & Callback Trapping (`src/gdb_session.py`)
+## 6. High-Speed Register, Memory & Disassembly Engine (`src/gdb_inspector.py`)
 
-### Startup Entry vs `-m` / `--main`
-* **Default:** `advance_to_entry_point()` stops at `starti`, computes `runtime_entry = runtime_base + (e_entry - base_vaddr)`, and skips `ld.so` initialization straight to `_start`.
-* **`-m` / `--main`:** Checks `has_symbol("main")`. If missing (e.g., stripped binary), aborts cleanly without starting; otherwise sets a temporary breakpoint at `main` and runs there.
+### Indexed Core Register Queries
+On modern x86-64 hardware, an unfiltered `-data-list-register-values x` returns 150+ registers (including AVX-512 `zmm0..zmm31`, `ymm`, `xmm`, and FPU stacks). During `_load_register_names()`:
+- `CORE_REGS` indices are cached as a space-separated query (`core_reg_query`) covering only the 18 core GPRs/IP/Flags (or 10 on `i386`, 34 on `aarch64`, 17 on `arm`).
+- `get_pc()` and `get_sp()` query **1 single register index** (`pc_reg_idx` / `sp_reg_idx`), while `step_instruction()` reads `PC` directly from `*stopped["frame"]["addr"]` at zero extra MI cost.
 
-### External Library & `.plt` Skipping + Callback Trapping
+### Disassembly & `ls` Alignment
+- `disassemble_range()` uses MI mode `2` (`-- 2`) to obtain raw instruction opcodes alongside Intel mnemonics, rebasing embedded PIE targets via `rebase_disas_text()`.
+- `disassemble_context(pc, before, after)` anchors disassembly at the enclosing function's start address (or `e_entry`) before slicing `[pc_idx - before : pc_idx + after + 1]` inside `.text`, ensuring synchronized x86 variable-length decoding and reporting `cut_top` / `cut_bottom` flags.
+
+---
+
+## 7. Execution Control, External Skipping, `call` & `ignore` (`src/gdb_session.py`)
+
+### Entry & Restart Semantics
+- `advance_to_entry_point()` uses `starti` to map the process, discovers `runtime_base` from `info proc mappings` (or `info auxv` `AT_PHDR`/`AT_ENTRY`), and advances past `ld.so` to `_start`.
+- `restart_to_entry()` resets `started`, `exited`, `exit_code`, `target_output_buffer`, `all_target_output`, and `_cached_stack_bounds`, allowing `start`, `main`, `run`, `call`, and `0x...` to restart seamlessly after exit.
+
+### External Library & Callback Handling
 When `SKIP_EXTERNAL_FUNCTIONS = True`:
-1. **`next [N]`:** Batches `N > 1` natively via a single `-interpreter-exec console "ni {count}"` command.
-2. **`step [N]`:** If `PC` enters a `.plt*` stub (`addr_in_plt(pc) == True`) or external shared library (`addr_in_main_binary(pc) == False`):
-   - **Callback Trap:** `_detect_callback_arg0()` inspects the first ABI argument (`RDI` on x86-64, `X0` on AArch64, `R0` on ARM32, `[ESP+4]` on i386). If it points inside `.text` (e.g., `main` passed from `_start` into `__libc_start_main`, or a callback passed to `qsort`), a one-shot temporary breakpoint is placed at that `.text` target so `step` lands inside `main()` instead of exiting!
-   - **Fast PLT Return:** For standard external calls like `printf@plt` / `puts@plt`, reads the return address directly from `[SP]` (or `LR` on ARM), sets a one-shot temporary breakpoint there, and continues straight back to the caller instruction.
-   - **Fallback:** Executes `-exec-finish` (looping cleanly past any `syscall-entry`/`syscall-return` events if active).
+1. **`next N`:** Runs `-interpreter-exec console "ni {N}"` natively in a single MI call.
+2. **PLT Fast Return:** When `PC` enters a `.plt*` section (`addr_in_plt`), `step_over_or_finish_external()` reads the caller return address from `[SP]` (`x86_64`/`i386`) or `LR` (`aarch64`/`arm`), inserts a one-shot temporary breakpoint inside `.text`, and continues straight back to the caller instruction.
+3. **Callback Trapping (`_detect_callback_arg0`):** Inspects ABI argument 0 (`RDI`, `X0`, `R0`, or `[ESP+4]`) before leaving `_start` or callback-taking libc calls; if it points into `.text` (e.g., `main` passed to `__libc_start_main`), a one-shot breakpoint traps entry into `main()`—working even on stripped binaries.
 
-### Restartability & Direct Control
-- `restart_to_entry()` resets `started`, `exited`, `exit_code`, and cached stack bounds cleanly so `start`, `main`, `run` (after exit), and `0x...` all work seamlessly even after program termination.
-- `jump_to_target()` resolves any hex address or symbol and updates `$pc` directly via `-gdb-set $pc = 0x...`.
+### `IgnoreCallManager`
+Supports four modes with immediate override priority:
+- `none`: normal stepping into user functions.
+- `all` (`ignore call`): all `call` instructions step over.
+- `count` (`ignore once` / `ignore call N`): checks `_is_call_insn()` at `PC` before stepping and decrements `remaining` only when a `call` is skipped.
+- `nest` (`ignore nest`): snapshots `nest_base_depth` and permits stepping 1 call level deeper (`<= nest_base_depth + 1`) while skipping deeper nested calls.
 
----
+### `call <target> [--ignore]`
+- Scans forward from `PC` in `.text` (`find_upcoming_call`) for exact `<name>` / `<name@plt>` matches first, then substring matches.
+- Runs to the call instruction and steps 1 instruction into user callees (or stops on the `call` if it is an external `@plt` stub when `SKIP_EXTERNAL_FUNCTIONS = True`).
+- If not visible ahead of `PC`, fails immediately unless exact `--ignore` is supplied—in which case it resolves against `get_binary_functions()` (never `libc`) and breaks globally until hit.
 
-## 6. Stationary Live View, Split Layout & Call Nesting (`src/live_view.py`)
-
-### Stationary Page Caching
-Each visible call frame maintains its own cached instruction list (`frame_pages[idx]`). A page is only re-fetched when:
-1. `force_refresh` is `True` (user changed `size N`, `nestN`, `main`, `start`, `jump`, or `0x...`), or
-2. `PC` steps or jumps outside the cached page (`not any(a == pc for a, _, _ in cached)`).
-
-When `PC` walks within the page, ANSI `\033[2J\033[H` redraws the exact same instructions in place and moves only the `=>` arrow.
-
-### Nested Call Windows (`nest` / `nestN`)
-`get_binary_call_frames()` parses `-stack-list-frames`, filters out intermediate external library frames (`libc`/`ld.so`), and reverses them into `outermost -> innermost` order.
-* `nest0` (default): shows only the active innermost frame.
-* `nest` / `nest1` .. `nestN`: keeps the root frame (`frames[0]`) plus up to `N` deepest nested frames (`frames[1:][-N:]`).
-* Parent frames mark their call instruction with `->`; the active innermost frame marks `PC` with `=>`. Returned frames are evicted automatically.
-
-### Wide-Screen Layout & Change Highlighting
-* Queries `shutil.get_terminal_size()`. When `term_cols >= VIEW_SPLIT_MIN_COLS` (`125`), `render_two_columns()` places Code (+ Registers if Stack is also active) on the left pane and Stack/Registers on the right pane separated by `|`.
-* Compares `regs` against `prev_regs` and 16-byte stack rows against `prev_stack_map`, prefixing changed entries with `*`.
+### Interactive `stdin` & Interrupt Handling
+- `_maybe_proactive_stdin()` inspects the `call` target before stepping over `fgets`, `gets`, `scanf`, `getchar`, `getline`, or `read@plt`, flushes buffered TTY newlines via `termios.tcflush`, and writes user input to the FIFO.
+- `_wait_stopped_interactive()` polls running waits (`0.7s`) and converts `KeyboardInterrupt` (`Ctrl+C`) into `-exec-interrupt` so the target pauses cleanly without terminating the debugger.
 
 ---
 
-## 7. Zero-Trimmed Stack Inspection & Binary Dumping
+## 8. Stationary Live View, Split Layout, `nestN` & Color Diffs (`src/live_view.py`, `src/colors.py`)
 
-Linux allocates a ~135 KB `[stack]` VMA where low addresses below `SP` are unallocated zero pages.
-1. `get_stack_bounds()` caches `[stack]` `(start, end)` from `info proc mappings` (re-querying only if `SP` leaves the cached range).
-2. `dump_stack_to_file(full=False)` dumps `[SP .. stack_end]` instead of `[stack_start .. stack_end]`, then `trim_zero_stack()` removes leading and trailing 16-byte all-zero rows (`TRIM_STACK_DUMP_ZEROS = True`) so `xxd <binary>.stack.bin` shows only active stack data.
-3. Passing `dump stack full` bypasses trimming and dumps the entire `[stack]` mapping.
+### Flicker-Free Single-Flush Rendering
+`render_live_screen()` builds the complete screen in memory and writes it in one syscall:
+```text
+\033[H + (line + \033[K + \n)... + \033[J
+```
+Avoiding `\033[2J` on redraws eliminates blank-frame flicker even while holding `Enter`.
+
+### Stationary Frame & Nested Call Panes (`nestN`)
+- `get_binary_call_frames()` parses `-stack-list-frames`, filters out external shared-library frames (`libc`/`ld.so`), and reverses into `outermost -> innermost`.
+- `select_visible_frames(frames, nest_limit)` retains the root frame plus up to `nest_limit` deepest active callees (`nest` = `nest1`, `nest2`..`nestN`).
+- Each frame caches its instruction window in `frame_pages[idx]` and refreshes only when `PC` exits the cached page or when `force_refresh` is triggered (`size`, `nest`, `jump`, `main`, `start`, `call`, `0x...`).
+
+### Wide-Screen Layout & Byte/Char Diffs
+- When `term_cols >= VIEW_SPLIT_MIN_COLS` (`125`), `render_two_columns()` aligns panes side-by-side using `visible_len()` and `pad_visible()` so ANSI SGR codes never shift the `|` separator.
+- `highlight_char_diff()` colors only changed characters in `[REGISTERS]`.
+- `format_diff_xxd_line()` compares each byte address against `prev_stack_bytes: dict[int, int]` (surviving 8-byte `SP` shifts intact) and colors only changed bytes in both the hex and ASCII columns.
+- `colors_active()` enforces `ENABLE_COLORS and _HAS_COLORAMA and sys.stdout.isatty()`, guaranteeing zero ANSI escape leakage when piped to files or clipboards.
 
 ---
 
-## 8. Execution Mapping & Syscall Tracing (`src/mapper.py`)
+## 9. Zero-Trimmed Stack Inspection & Binary Dumping
 
-1. Advances to `--func <addr>` (if specified) or `_start` *before* enabling `catch syscall` (preventing `ld.so` startup syscalls from interrupting initial breakpoint arrival).
-2. Tracks call depth (`func_depth`) on `call`/`bl` and `ret`/`bx lr` instructions when `--func` is active, automatically stopping once the traced function returns.
-3. Skips external library execution automatically via `step_over_or_finish_external()`.
-4. Classifies every instruction (`jump`, `call`, `ret`, `mem`) and samples `VmHWM` peak memory from `info proc status`.
-5. Enforces `MAX_MAP_FOLDER_MB` (`250` MB) via `FolderSizeGuard` across `full_trace.txt`, `syscalls_trace.txt`, and `functions/func_0x*.txt`, finalizing `summary.txt` cleanly with European 24-hour timestamps (`DD-MM-YYYY HH:MM:SS`).
+- `dump_stack_to_file(full=False)` dumps `[SP .. stack_end]` rather than the entire `135 KB` `[stack]` VMA.
+- `trim_zero_stack()` strips leading and trailing 16-byte all-zero rows when `TRIM_STACK_DUMP_ZEROS = True` and reports the exact trimmed `[start - end]` memory range and byte count.
+- Inside `view`, `COLLAPSE_STACK_ZEROS_IN_VIEW = True` collapses runs of 3+ unchanged all-zero 16-byte rows into a compact summary line (`... (N zero lines / B bytes skipped) ...`) while tracking every underlying byte address in `cur_bytes`.
 
 ---
 
-## 9. Bubblewrap Sandboxing & QEMU Cross-Arch Architecture (`src/sandbox.py`)
+## 10. Session Recording Specification (`src/recorder.py`)
+
+`SessionRecorder` writes deterministic, non-JSON records into `record-<binary>_<DD-MM-YYYY_HH-MM-SS>/`:
+- `full_recording.txt`: Complete chronological event stream (`[EVENT #00001]`, European 24h timestamp, `CMD`, `DURATION` in ms, `LOCATION`, `NOTE`, `STDOUT`, `CHANGED` registers, `+/- RECORD_DISAS_CONTEXT` disassembly, and stack).
+- `functions/func_<name>.txt`: Per-function event logs (directory created lazily only when function events exist).
+- **Stack Size Discipline:** Logs `FULL ACTIVE STACK` on event #1, whenever entering a new function, and on exit; logs only `STACK CHANGED` rows on intermediate steps within the same function.
+- **Idle-Only Disk I/O:** Events accumulate in memory buffers during command execution and flush exclusively at prompt wait boundaries (`flush_idle()`) and `atexit`/`finally` hooks.
+
+---
+
+## 11. Autonomous Execution Mapping & Syscall Tracing (`src/mapper.py`)
+
+`run_execution_mapper()` records a complete execution profile under `<binary>-mapped_<DD-MM-YYYY_HH-MM-SS>/`:
+1. Advances to `--func`, `main` (`-m`), or `_start` *before* enabling `catch syscall`.
+2. When `--func` is specified, tracks call depth (`func_depth`) across `call` and `ret` instructions and halts cleanly when the target invocation returns.
+3. Skips external shared-library instructions via `step_over_or_finish_external(..., on_syscall=record_syscall_event)`, capturing syscalls triggered inside `libc` (such as `write`, `newfstatat`, `brk`, and non-returning `exit_group`).
+4. Classifies instructions (`jump`, `call`, `ret`, `mem`) via `classify_instruction()`, samples `VmHWM` peak memory from `info proc status`, and enforces `MAX_MAP_FOLDER_MB` (`250` MB) via `FolderSizeGuard`.
+
+---
+
+## 12. Bubblewrap Sandbox & Cross-Architecture QEMU Design (`src/sandbox.py`)
 
 ```text
 Host Filesystem                       Bubblewrap Sandbox (/tmp/work)
@@ -193,25 +230,41 @@ Host Filesystem                       Bubblewrap Sandbox (/tmp/work)
 │ /home/<user>/...       │ ──[NONE]──►│ Completely hidden & unmounted        │
 │ Host Network Stack     │ ──[NONE]──►│ --unshare-all (no internet sockets)  │
 │ /usr, /bin, /lib*      │ ──[RO]────►│ Read-only system runtime & QEMU bins │
-│ Target Binary Copy     │ ──[RW]────►│ /tmp/work/target_bin                 │
+│ Target Binary & FIFOs  │ ──[RW]────►│ /tmp/work/target_bin & target_stdin  │
 └────────────────────────┘            └──────────────────────────────────────┘
 ```
 
-* **Native Execution:** `bwrap` runs `gdb --interpreter=mi2 -q /tmp/work/target_bin` directly inside the sandbox (`gdb` is parent of `target_bin`, so `ptrace` works even under `yama.ptrace_scope=1` and `--cap-drop ALL`).
-* **Cross-Architecture Emulation:** When `needs_qemu(host_arch, target_arch)` is `True`, a sandboxed wrapper script launches `qemu-<arch> -g <ephemeral_port> /tmp/work/target_bin` in the background and connects `gdb-multiarch` via `-target-select remote 127.0.0.1:<port>`.
-* **`--no-sandbox` Gate:** Requires two explicit confirmations followed by matching `"iknow"` (whitespace- and case-insensitive) in the final prompt.
+- **Native Debugging:** Runs `gdb --interpreter=mi2` directly inside `bwrap --unshare-all --cap-drop ALL --new-session --die-with-parent --clearenv`, keeping `gdb` as the direct parent of the inferior so `ptrace` operates cleanly under `yama.ptrace_scope=1`.
+- **Cross-Architecture Emulation:** When `needs_qemu(host_arch, target_arch)` is `True` (e.g., `aarch64`/`arm` on `x86_64`), a sandboxed shell wrapper spawns `qemu-<arch> -g <port> target_bin < target_stdin` and connects `gdb-multiarch` to `127.0.0.1:<port>` inside the sandbox.
+- **`--no-sandbox` Safety Gate:** `confirm_disable_sandbox()` displays a prominent warning and requires two confirmations followed by matching `"iknow"` (case- and whitespace-insensitive) before executing directly on the host.
 
 ---
 
-## 10. Engineering Post-Mortem: Bugs Solved & Performance Optimizations
+## 13. Configuration Reference (`src/config.py`)
 
-| # | Issue Discovered | Root Cause | Permanent Fix |
-| :--- | :--- | :--- | :--- |
-| **1** | `select.select()` deadlock on GDB startup | Python `TextIOWrapper` (`bufsize=1`) buffered `(gdb) ` in user space while `select` blocked on an empty kernel FD. | Switched to unbuffered `bufsize=0` binary pipe + `bytearray` line buffer (`_readline_timeout`). |
-| **2** | `--map -func` hung in `ld.so` | `catch syscall` was enabled before `run_or_continue()` reached `--func`, stopping inside `ld.so` startup syscalls. | Enabled `catch syscall` only *after* hitting `--func` or `_start`. |
-| **3** | `result=25` / target stdout missing | Without a PTY, GDB emits inferior stdout as `raw` lines rather than `@"..."` MI records. | Captured `raw` lines in `MIProtocol` and split glued MI records via `MI_EMBEDDED_RE`. |
-| **4** | `step` walked through `puts@plt` | `.plt*` sections reside inside the main binary's executable `PT_LOAD` segment. | Parsed ELF section headers for `.plt*` and added fast `[SP]`/`LR` return-address trapping. |
-| **5** | `step` through `_start` exited without entering `main` | `_start` passes `main` in `RDI` to `__libc_start_main`; `-exec-finish` ran past `main` to exit. | Added `_detect_callback_arg0()` to trap `.text` callbacks passed to external calls. |
-| **6** | `ls 21` disassembled trailing `0x00` bytes | Execution bounds clamped to 4 KB `PT_LOAD` page end instead of `.text` section size. | Parsed `.text` (`sh_addr`, `sh_size`) in `elf_utils.py` and clamped disassembly bounds. |
-| **7** | Previous lines vanished on every step in `view` | `len(page_insns) != page_size` re-anchored the page top to `PC` near the end of `.text`. | Replaced with `should_refresh_page()` using explicit `force_refresh` and `pc not in page`. |
-| **8** | `step 9` took ~6–8 seconds | Unindexed `-data-list-register-values x` serialized 150+ AVX-512/FPU registers multiple times per step + repeated `info proc mappings`. | Indexed only the 18 core registers, used `*stopped` frame addresses for `PC`, cached `[stack]` bounds, and batched `next N` via `ni N`. |
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `DEFAULT_INFO_FORMAT` | `"hex"` | Default format for CLI `info`/`show` (`"hex"`, `"dec"`, `"char"`, `"str"`, `"all"`). |
+| `ENABLE_COLORS` | `True` | Enable TTY-only green diff highlights via optional `colorama`. |
+| `PROMPT_SHOW_ADDRESS` | `True` | Display current `objdump`-style `PC` in prompts. |
+| `PROMPT_SHOW_FUNCTION` | `True` | Display current function name in prompts. |
+| `PROMPT_SHOW_TOOL_NAME` | `False` | Prefix prompt with `PROMPT_TOOL_NAME` (`"bdf"`). |
+| `USE_OBJDUMP_ADDR` | `True` | Rebase PIE addresses inside the binary to `objdump` offsets. |
+| `SHOW_OPCODES_IN_DISAS` | `True` | Show raw hex opcodes alongside Intel assembly. |
+| `VIEW_PAGE_SIZE` | `41` | Default instruction window size in `view`. |
+| `VIEW_DEFAULT_REGS` | `True` | Show `[REGISTERS]` panel by default when opening `view`. |
+| `VIEW_DEFAULT_STACK` | `True` | Show `[STACK]` panel by default when opening `view`. |
+| `VIEW_DEFAULT_REG_FORMAT` | `"all"` | Default register display format inside `view`. |
+| `VIEW_DEFAULT_NEST` | `0` | Default nested call pane count (`0` = active function only). |
+| `VIEW_HIGHLIGHT_CHANGES` | `True` | Mark changed registers & stack bytes with `*` and green diffs. |
+| `VIEW_SPLIT_MIN_COLS` | `125` | Terminal column threshold for side-by-side split layout. |
+| `VIEW_STACK_ROWS` | `14` | Fallback stack rows on narrow terminals. |
+| `COLLAPSE_STACK_ZEROS_IN_VIEW` | `True` | Collapse runs of 3+ unchanged zero stack lines in `view`. |
+| `RECORD_DISAS_CONTEXT` | `4` | Instructions recorded before & after `PC` per `--record` event. |
+| `SKIP_EXTERNAL_FUNCTIONS` | `True` | Auto-skip `.plt` stubs, `ld.so`, and `libc` internals during `step`. |
+| `TRIM_STACK_DUMP_ZEROS` | `True` | Trim leading/trailing pure-zero rows in `dump stack`. |
+| `MAX_MAP_FOLDER_MB` | `250` | Maximum output size (MB) for `--map` trace folders. |
+| `MAX_MAP_INSTRUCTIONS` | `2_000_000` | Safety instruction limit for `--map` against infinite loops. |
+| `MAX_INTERACTIVE_STEPS` | `100_000` | Maximum step/next count per single interactive command. |
+| `EU_FOLDER_TS_FORMAT` | `"%d-%m-%Y_%H-%M-%S"` | European 24-hour folder timestamp format. |
+| `EU_LOG_TS_FORMAT` | `"%d-%m-%Y %H:%M:%S"` | European 24-hour log timestamp format. |
