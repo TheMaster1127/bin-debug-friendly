@@ -271,15 +271,6 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         return True, f"Stopped at {symbol}", stopped
 
     def run_to_next_call(self, raw_args: str) -> tuple[bool, str, dict | None]:
-        """
-        Parses `call <target> [--ignore]`.
-        1. Scans forward from PC in the current code for the first upcoming `call <target>`.
-           If found, runs to that call site and steps 1 instruction inside the callee.
-        2. If NOT visible ahead of PC:
-           - Without exact `--ignore`: errors immediately without running in the background.
-           - With exact `--ignore`: checks if <target> exists in the binary's own functions
-             and breaks/runs globally until reached (or errors immediately if non-existent).
-        """
         tokens = raw_args.strip().split()
         ignore_missing_in_view = False
         filtered: list[str] = []
@@ -325,7 +316,6 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
                 None,
             )
 
-        # `--ignore` passed: check only against this binary's own functions (never random libc functions)
         bin_funcs = self.get_binary_functions()
         low = target_name.lower()
         sym_to_try = next((f for f in bin_funcs if f.lower() == low), None)
@@ -667,9 +657,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
             if res["status"] == "error":
                 return self._exec_single_step(step_over=True)
 
-        stopped = res["stopped"] or (
-            self.wait_stopped(timeout=10.0) if on_syscall is not None else self._wait_stopped_interactive(initial_timeout=0.7)
-        )
+        stopped = res["stopped"] or self._wait_stopped_interactive(initial_timeout=0.7)
         if stopped:
             self._on_stopped_record(stopped)
 
@@ -687,7 +675,7 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
             if cur_pc is not None and self.addr_in_main_binary(cur_pc):
                 break
             res2 = self.send("-exec-continue")
-            stopped = res2["stopped"] or self.wait_stopped(timeout=10.0)
+            stopped = res2["stopped"] or self._wait_stopped_interactive(initial_timeout=0.7)
             if stopped:
                 self._on_stopped_record(stopped)
         return stopped

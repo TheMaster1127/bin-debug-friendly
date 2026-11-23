@@ -47,7 +47,7 @@ In plain GDB:
 - **Exact `objdump` addresses everywhere:** Copy `0x12c4` (or `12c4`, or `" 0x 12 c4 "`) straight from disassembly and type `0x12c4` or `stop 0x12c4`—PIE rebasing happens automatically.
 - **Intel syntax locked in:** Clean `objdump`-style Intel disassembly with raw hex opcodes and rebased target comments (`# 0x2004`, `call 0x1030 <puts@plt>`).
 - **Stationary Live `view`:** A flicker-free dashboard where your code stays locked in place while only the `=>` arrow walks down, your registers update live in all formats (`hex | dec | char | str`), and changed characters & stack bytes light up **bright green** right beside the code.
-- **Built-in execution mapper & session recorder:** Trace every main-binary instruction and system call into clean, structured text folders (`--map`), or record your interactive debugging steps for later human or AI analysis (`--record`).
+- **Built-in execution mapper & session recorder:** Trace every main-binary instruction, active stack diff, and system call into clean, structured text folders (`--map`), or record your interactive debugging steps for later human or AI analysis (`--record`).
 - **Sandboxed by default:** Every target binary executes inside an air-gapped **Bubblewrap (`bwrap`)** container with `/home` hidden and zero internet access.
 
 ---
@@ -60,7 +60,7 @@ In plain GDB:
 * **Exact Green Diffs (`src/colors.py`):** Highlights only the exact changed hex/decimal/ASCII characters in `[REGISTERS]` and only the exact changed bytes in `[STACK]` (auto-disabled cleanly when `colorama` is absent or stdout is piped to a file/clipboard).
 * **Smart `call <func> [--ignore]` + Tab Autocomplete:** Autocompletes strictly from your binary's `.symtab` and `.text`/`.plt` calls (never polluted with `libc` symbols), runs to the upcoming call site, and steps straight inside.
 * **Granular Call Ignoring:** `ignore call`, `ignore once`, `ignore call N`, `ignore nest`, and `unignore call`.
-* **Non-Colliding Target `stdin`:** Dedicated sandboxed FIFO handles `fgets`, `scanf`, `getchar`, `getline`, and `read` cleanly—flushing held Enter keys and prompting you seamlessly without corrupting GDB's control pipe.
+* **Non-Colliding Target `stdin`:** Dedicated sandboxed FIFO handles `fgets`, `scanf`, `getchar`, `getline`, and `read` cleanly—flushing held Enter keys and prompting you seamlessly without corrupting GDB's control pipe (works in interactive CLI, `view`, and `--map`!).
 * **Zero-Trimmed `.stack.bin` Dumps:** Dumps only the active stack (`SP` upward) stripped of empty guard zeros, ready immediately for `xxd`.
 * **Session Recording (`--record`) & Execution Mapping (`--map`):** Clean, structured, predictable non-JSON output folders with European 24-hour timestamps (`DD-MM-YYYY HH:MM:SS`).
 
@@ -74,11 +74,11 @@ python3 main.py <binary> [target_args...] [OPTIONS]
 
 | Flag | Argument | Description |
 |------|----------|-------------|
-| `-m`, `-main`, `--main` | *(none)* | Start and automatically pause at `main()`. Errors out cleanly without starting if the binary is stripped or has no `main` symbol. |
+| `-m`, `-main`, `--main` | *(none)* | Start and automatically pause at `main()`. Also pairs with `--map` to map from `main()` forward! Errors out cleanly without starting if the binary is stripped or has no `main` symbol. |
 | `-record`, `--record` | *(none)* | Record every interactive command, timing, disassembly context, register diff, full active stack, and `stdout` into `record-<bin>_<DD-MM-YYYY_HH-MM-SS>/`. |
-| `-map`, `--map` | *(none)* | Run non-interactive execution mapper: trace main-binary instructions, registers, syscalls, and stats into `<bin>-mapped_<DD-MM-YYYY_HH-MM-SS>/`. |
+| `-map`, `--map` | *(none)* | Run autonomous execution mapper: traces instructions, register states, active stack snapshots & diffs, system calls, and stats into `<bin>-mapped_<DD-MM-YYYY_HH-MM-SS>/`. |
 | `-func`, `--func`, `--function` | `ADDR\|SYM` | With `--map`: start tracing when `ADDR` or `SYM` is entered and automatically stop when it returns. |
-| `--dump-stack-syscalls` | *(none)* | With `--map`: save a `.stack.bin` binary snapshot on every system call entry. |
+| `--dump-stack-syscalls` | *(none)* | With `--map`: save binary `.stack.bin` snapshots on every system call entry. |
 | `--no-sandbox` | *(none)* | Disable Bubblewrap isolation and debug directly on the host (triggers a full-screen warning and 3-step confirmation requiring `"I know"`). |
 
 ### Default Entry Behavior
@@ -177,7 +177,7 @@ Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` line edi
 | **`ignore call`** | `/ignore call`, `ignore calls`, `skip call` | Makes `step` skip over all `call` instructions until disabled. |
 | **`ignore once`** | `ignore call 1`, `ignore 1` | Ignores the next `1` call instruction encountered. |
 | **`ignore call <N>`** | `ignore <N>`, `skip call <N>` | Ignores the next `N` call instructions encountered, decrementing only on actual `call` opcodes. |
-| **`ignore nest`** | `ignore nested` | Allows stepping 1 call level deeper, then skips any nested sub-calls inside it. |
+| **`ignore nest`** | `ignore nested` | Allows stepping 1 call level deeper, then skips any deeper nested calls inside it. |
 | **`unignore call`** | `unignore`, `unskip call` | Restores normal stepping into calls. |
 | **`stdin <text>`** | — | Pre-queues an input line into the target's `stdin` FIFO before stepping past `fgets`/`scanf`/`read`. |
 
@@ -191,7 +191,7 @@ Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` line edi
 | **`info stack`** | — | Prints all registers followed by the active stack preview. |
 | **`info raw stack`** | `info stack only` | Prints only the active stack preview (no registers). |
 | **`get <reg>`** | — | Case-insensitive single-register inspection in all formats (`hex \| dec \| char \| str`). |
-| **`set <reg> [to] <val>`** | — | Sets a register using hex (`0x2a`), decimal (`42`), or quoted ASCII (`"ABCD"`). |
+| **`set <reg> [to] <val>`** | — | Sets a register using hex (`0x2a`), decimal (`42`), or ASCII (`"ABCD"`). |
 | **`stack`** | — | Previews the top and bottom of the active stack around `SP`. |
 | **`stack less`** | — | Pipes the active stack directly into `less` for interactive scrolling. |
 | **`stack info`** | — | Prints `[stack]` region bounds, total mapped size, active bytes (`SP` to top), and unused bytes. |
@@ -263,7 +263,7 @@ view [...] 0x124f (main)> call check_password
 
 When debugging crackmes or CLI tools that read user input (`fgets`, `scanf`, `gets`, `getchar`, `getline`, `read`):
 - The target binary's `fd 0` is wired to a dedicated sandboxed FIFO (`/tmp/work/target_stdin`), completely separate from GDB's MI2 pipe.
-- Whenever you step over or run into an input call (or whenever a running target waits for input), `bin-debug-friendly`:
+- Whenever you step over or run into an input call (or whenever a running target waits for input in interactive mode or `--map`), `bin-debug-friendly`:
   1. Flushes any accidental held-down `Enter` keystrokes from your terminal (`termios.tcflush`) so spamming `Enter` while stepping never skips the prompt.
   2. Prompts cleanly:
      ```text
@@ -320,8 +320,11 @@ record-crackme_23-11-2026_14-04-27/
 
 Run non-interactive execution tracing across the whole binary or a single function:
 ```bash
-# Map entire main-binary execution + syscalls
+# Map entire main-binary execution + stack + syscalls (starts from _start)
 python3 main.py ./my_program --map
+
+# Map from main() forward
+python3 main.py ./my_program --map -m
 
 # Map only a specific function (auto-detects return via call depth)
 python3 main.py ./my_program -map -func 0x1189
@@ -333,7 +336,8 @@ python3 main.py ./my_program --map --dump-stack-syscalls
 Creates `<program>-mapped_<DD-MM-YYYY_HH-MM-SS>/` (non-JSON, human-readable & grep-friendly, hard-capped at `MAX_MAP_FOLDER_MB = 250` MB):
 ```text
 my_program-mapped_23-11-2026_12-29-58/
-├── full_trace.txt        # Chronological instruction trace, EU timestamps, func addr, all GPRs
+├── full_trace.txt        # Chronological instruction trace, EU timestamps, func addr, all GPRs,
+│                         # FULL ACTIVE STACK on function entry & STACK CHANGED rows on modifying steps
 ├── syscalls_trace.txt    # Every syscall: name, number, caller PC, time in/out, regs in, ret out
 ├── summary.txt           # Instruction totals, jumps/calls/rets/mem accesses, VmHWM peak memory, func & syscall tables
 └── functions/
@@ -341,7 +345,10 @@ my_program-mapped_23-11-2026_12-29-58/
     ├── func_0x1139.txt
     └── func_0x1189.txt
 ```
-- **Skips `libc` / `ld.so` clutter** automatically while still trapping callbacks back into your binary (such as `main()` from `__libc_start_main`) and logging every syscall invoked inside external library calls (`write`, `newfstatat`, `brk`, `exit_group`, etc.).
+- **Active Stack Tracking:** Unlike raw GDB instruction tracers, `full_trace.txt` logs `FULL ACTIVE STACK` on each function entry and `STACK CHANGED` rows on steps where the stack is modified.
+- **Interactive `stdin` Support:** If the binary calls `fgets`/`scanf`/`read` during `--map`, it cleanly asks for input via `[INPUT]` without hanging in the background.
+- **Clean Interrupts:** Pressing `Ctrl+C` cleanly finalizes the partial trace and records `Interrupted By User : YES` in `summary.txt`.
+- **Skips `libc` / `ld.so` Clutter:** Automatically skips external shared-library instructions while still trapping callbacks back into your binary (such as `main()` from `__libc_start_main`) and logging every syscall invoked inside external calls (`write`, `newfstatat`, `brk`, `exit_group`, etc.).
 
 ---
 

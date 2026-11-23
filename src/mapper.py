@@ -12,6 +12,7 @@ from src.config import (
     MAX_MAP_INSTRUCTIONS,
 )
 from src.elf_utils import parse_address_input, resolve_target_address
+from src.formatters import format_xxd_lines, prompt_for_target_stdin
 from src.gdb_session import GdbSession
 
 MAX_MAP_FOLDER_BYTES = MAX_MAP_FOLDER_MB * 1024 * 1024
@@ -73,12 +74,45 @@ class FolderSizeGuard:
         self.written_bytes += num_bytes
 
 
+def _read_active_stack_lines(session: GdbSession) -> list[str]:
+    lo, hi, sp, _ = session.get_stack_bounds()
+    active_len = min(max(64, hi - sp), 64 * 1024)
+    data = session.read_memory(sp, active_len) or b""
+    if not data:
+        return []
+    return format_xxd_lines(data, sp, sp)
+
+
+def _format_stack_section(
+    stack_lines: list[str],
+    last_stack_lines: list[str],
+    is_func_entry: bool,
+) -> str:
+    if not stack_lines:
+        return ""
+    if is_func_entry or not last_stack_lines:
+        out = [f"  FULL ACTIVE STACK ({len(stack_lines)} lines):"]
+        out.extend(f"    {ln}" for ln in stack_lines)
+        return "\n".join(out) + "\n"
+
+    prev_set = set(last_stack_lines)
+    diff_lines = [ln for ln in stack_lines if ln not in prev_set]
+    if not diff_lines:
+        return ""
+    out = [f"  STACK CHANGED ({len(diff_lines)} lines):"]
+    out.extend(f"    {ln}" for ln in diff_lines)
+    return "\n".join(out) + "\n"
+
+
 def run_execution_mapper(
     session: GdbSession,
     func_spec: str | None = None,
     dump_stack_syscalls: bool = False,
     start_at_main: bool = False,
 ) -> Path:
+    if session.stdin_prompt_handler is None:
+        session.stdin_prompt_handler = prompt_for_target_stdin
+
     now_dt = datetime.now()
     folder_name = f"{session.host_binary_path.name}-mapped_{now_dt.strftime(EU_FOLDER_TS_FORMAT)}"
     out_dir = Path.cwd() / folder_name
@@ -148,6 +182,7 @@ def run_execution_mapper(
     t_start = time.time()
     pending_syscall_entry: dict | None = None
     last_main_pc: int = session.get_pc() or 0
+    interrupted = False
 
     with (
         full_trace_path.open("w", encoding="utf-8") as f_trace,
@@ -228,109 +263,127 @@ def run_execution_mapper(
         func_depth = 1 if target_func_addr is not None else None
         last_was_call = False
         returned_via_external = False
+        seen_funcs: set[int] = set()
+        last_stack_lines: list[str] = []
 
-        while not session.exited and total_insns < MAX_MAP_INSTRUCTIONS:
-            if guard.truncated:
-                print(f"[!] Map folder size limit ({MAX_MAP_FOLDER_MB} MB) reached; stopping trace cleanly.")
-                break
-
-            pc = session.get_pc()
-            if pc is None:
-                break
-
-            if not session.addr_in_main_binary(pc):
-                returned_via_external = True
-                ext_stopped = session.step_over_or_finish_external(
-                    current_pc=pc,
-                    from_pc=last_main_pc,
-                    allow_callback_trap=(func_spec is None),
-                    on_syscall=record_syscall_event,
-                )
-                if ext_stopped and ext_stopped.get("reason") in ("syscall-entry", "syscall-return"):
-                    record_syscall_event(ext_stopped)
-                if session.exited:
+        try:
+            while not session.exited and total_insns < MAX_MAP_INSTRUCTIONS:
+                if guard.truncated:
+                    print(f"[!] Map folder size limit ({MAX_MAP_FOLDER_MB} MB) reached; stopping trace cleanly.")
                     break
-                continue
 
-            if returned_via_external:
-                returned_via_external = False
-                if last_was_call:
-                    if pc > last_main_pc + 16 or pc < last_main_pc:
-                        call_stack.append(pc)
-                        func_counts[pc] = func_counts.get(pc, 0) + 1
+                pc = session.get_pc()
+                if pc is None:
+                    break
+
+                if not session.addr_in_main_binary(pc):
+                    returned_via_external = True
+                    ext_stopped = session.step_over_or_finish_external(
+                        current_pc=pc,
+                        from_pc=last_main_pc,
+                        allow_callback_trap=(func_spec is None),
+                        on_syscall=record_syscall_event,
+                    )
+                    if ext_stopped and ext_stopped.get("reason") in ("syscall-entry", "syscall-return"):
+                        record_syscall_event(ext_stopped)
+                    if ext_stopped and ext_stopped.get("reason") == "interrupted":
+                        interrupted = True
+                        break
+                    if session.exited:
+                        break
+                    continue
+
+                if returned_via_external:
+                    returned_via_external = False
+                    if last_was_call:
+                        if pc > last_main_pc + 16 or pc < last_main_pc:
+                            call_stack.append(pc)
+                            func_counts[pc] = func_counts.get(pc, 0) + 1
+                        last_was_call = False
+                elif last_was_call:
+                    call_stack.append(pc)
+                    func_counts[pc] = func_counts.get(pc, 0) + 1
                     last_was_call = False
-            elif last_was_call:
-                call_stack.append(pc)
-                func_counts[pc] = func_counts.get(pc, 0) + 1
-                last_was_call = False
 
-            last_main_pc = pc
-            cur_func = call_stack[-1] if call_stack else (session.runtime_base or 0)
-            insns = session.disassemble_at(pc, count=1)
-            insn_text = insns[0][2] if insns else "<unknown>"
-            regs = session.get_registers()
+                last_main_pc = pc
+                cur_func = call_stack[-1] if call_stack else (session.runtime_base or 0)
+                is_func_entry = cur_func not in seen_funcs
+                seen_funcs.add(cur_func)
 
-            total_insns += 1
-            unique_addrs.add(pc)
-            cls_info = classify_instruction(insn_text)
-            if cls_info["jump"]:
-                jump_count += 1
-            if cls_info["call"]:
-                call_count += 1
-            if cls_info["ret"]:
-                ret_count += 1
-            if cls_info["mem"]:
-                mem_count += 1
+                insns = session.disassemble_at(pc, count=1)
+                insn_text = insns[0][2] if insns else "<unknown>"
+                regs = session.get_registers()
+                stack_lines = _read_active_stack_lines(session)
+                stack_block = _format_stack_section(stack_lines, last_stack_lines, is_func_entry)
+                if stack_lines:
+                    last_stack_lines = stack_lines
 
-            disp_pc = session.to_display_addr(pc)
-            disp_func = session.to_display_addr(cur_func)
-            regs_str = " ".join(f"{k.upper()}=0x{v:x}" for k, v in regs.items())
-            block = (
-                f"[STEP {total_insns:06d}] TIME={eu_timestamp_now()} | "
-                f"FUNC=0x{disp_func:x} | ADDR=0x{disp_pc:x} | INSN={insn_text}\n"
-                f"  REGS: {regs_str}\n"
-            )
-            block_bytes = len(block.encode("utf-8"))
-            if not guard.can_write(block_bytes):
-                print(f"[!] Map folder size limit ({MAX_MAP_FOLDER_MB} MB) reached.")
-                break
+                total_insns += 1
+                unique_addrs.add(pc)
+                cls_info = classify_instruction(insn_text)
+                if cls_info["jump"]:
+                    jump_count += 1
+                if cls_info["call"]:
+                    call_count += 1
+                if cls_info["ret"]:
+                    ret_count += 1
+                if cls_info["mem"]:
+                    mem_count += 1
 
-            f_trace.write(block)
-            guard.record(block_bytes)
+                disp_pc = session.to_display_addr(pc)
+                disp_func = session.to_display_addr(cur_func)
+                regs_str = " ".join(f"{k.upper()}=0x{v:x}" for k, v in regs.items())
 
-            if cur_func not in func_files:
-                fpath = func_dir / f"func_0x{disp_func:x}.txt"
-                fh = fpath.open("w", encoding="utf-8")
-                f_hdr = f"=== FUNCTION 0x{disp_func:x} TRACE ===\n\n"
-                fh.write(f_hdr)
-                guard.record(len(f_hdr.encode("utf-8")))
-                func_files[cur_func] = fh
-            if guard.can_write(block_bytes):
-                func_files[cur_func].write(block)
+                block = (
+                    f"[STEP {total_insns:06d}] TIME={eu_timestamp_now()} | "
+                    f"FUNC=0x{disp_func:x} | ADDR=0x{disp_pc:x} | INSN={insn_text}\n"
+                    f"  REGS: {regs_str}\n"
+                    f"{stack_block}"
+                )
+                block_bytes = len(block.encode("utf-8"))
+                if not guard.can_write(block_bytes):
+                    print(f"[!] Map folder size limit ({MAX_MAP_FOLDER_MB} MB) reached.")
+                    break
+
+                f_trace.write(block)
                 guard.record(block_bytes)
 
-            if cls_info["call"]:
-                last_was_call = True
-                if func_depth is not None:
-                    func_depth += 1
-            elif cls_info["ret"]:
-                if len(call_stack) > 1:
-                    call_stack.pop()
-                if func_depth is not None:
-                    func_depth -= 1
-                    if func_depth <= 0:
-                        session.step_instruction(1, respect_skip_external=False)
-                        break
+                if cur_func not in func_files:
+                    fpath = func_dir / f"func_0x{disp_func:x}.txt"
+                    fh = fpath.open("w", encoding="utf-8")
+                    f_hdr = f"=== FUNCTION 0x{disp_func:x} TRACE ===\n\n"
+                    fh.write(f_hdr)
+                    guard.record(len(f_hdr.encode("utf-8")))
+                    func_files[cur_func] = fh
+                if guard.can_write(block_bytes):
+                    func_files[cur_func].write(block)
+                    guard.record(block_bytes)
 
-            if total_insns % 250 == 1:
-                pm = session.get_peak_memory_kb()
-                if pm and pm > peak_mem_kb:
-                    peak_mem_kb = pm
+                if cls_info["call"]:
+                    last_was_call = True
+                    if func_depth is not None:
+                        func_depth += 1
+                elif cls_info["ret"]:
+                    if len(call_stack) > 1:
+                        call_stack.pop()
+                    if func_depth is not None:
+                        func_depth -= 1
+                        if func_depth <= 0:
+                            session.step_instruction(1, respect_skip_external=False)
+                            break
 
-            stopped = session.step_instruction(1, respect_skip_external=False)
-            while stopped and stopped.get("reason") in ("syscall-entry", "syscall-return"):
-                record_syscall_event(stopped)
+                if total_insns % 250 == 1:
+                    pm = session.get_peak_memory_kb()
+                    if pm and pm > peak_mem_kb:
+                        peak_mem_kb = pm
+
                 stopped = session.step_instruction(1, respect_skip_external=False)
+                while stopped and stopped.get("reason") in ("syscall-entry", "syscall-return"):
+                    record_syscall_event(stopped)
+                    stopped = session.step_instruction(1, respect_skip_external=False)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n[!] Mapping interrupted by user; finalizing partial trace...")
 
         if pending_syscall_entry is not None:
             entry = pending_syscall_entry
@@ -338,7 +391,7 @@ def run_execution_mapper(
                 f"[SYSCALL #{syscall_count:04d}] NAME={entry['name']} (num={entry['num']}) | "
                 f"CALLER=0x{entry['caller_pc']:x} | TIME_IN={entry['time']} | TIME_OUT={eu_timestamp_now()}\n"
                 f"  REGS_IN : {entry['regs_in']}\n"
-                f"  RET_OUT : <no return — process exited>\n"
+                f"  RET_OUT : <no return — process exited/interrupted>\n"
             )
             sc_bytes = len(sc_line.encode("utf-8"))
             if guard.can_write(sc_bytes):
@@ -371,6 +424,7 @@ def run_execution_mapper(
         f"Architecture          : {session.elf.arch} ({session.elf.bits}-bit, PIE={session.elf.is_pie})\n"
         f"Completed At          : {eu_timestamp_now()}\n"
         f"Elapsed Time          : {elapsed:.2f}s\n"
+        f"Interrupted By User   : {'YES' if interrupted else 'NO'}\n"
         f"Folder Size Written   : {guard.written_bytes / (1024 * 1024):.2f} MB / "
         f"{MAX_MAP_FOLDER_MB} MB cap\n"
         f"Truncated By Size Cap : {'YES' if guard.truncated else 'NO'}\n\n"

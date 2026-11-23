@@ -50,10 +50,11 @@ Raw GDB is built for source-level C/C++ debugging with full DWARF symbols. When 
 │     Interactive Frontend        │             │     Execution Mapper Mode       │
 │  • src/cli.py (REPL, ls, dump)  │             │  • src/mapper.py                │
 │  • src/live_view.py (TUI/nestN) │             │    - Instruction & Reg Trace    │
-│  • src/formatters.py (Intel/hex)│             │    - Syscall Catch & Stats      │
-│  • src/colors.py (TTY green)    │             │    - 250 MB Size Guard          │
-│  • src/recorder.py (--record)   │             └────────────────┬────────────────┘
-└────────────────┬────────────────┘                              │
+│  • src/formatters.py (Intel/hex)│             │    - Active Stack Snapshots &   │
+│  • src/colors.py (TTY green)    │             │      Stack Diff Logging         │
+│  • src/recorder.py (--record)   │             │    - Syscall Catch & Stats      │
+└────────────────┬────────────────┘             │    - 250 MB Size Guard          │
+                 │                              └────────────────┬────────────────┘
                  └───────────────────────┬───────────────────────┘
                                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -77,19 +78,19 @@ Raw GDB is built for source-level C/C++ debugging with full DWARF symbols. When 
 
 | Module | Primary Role | Key Exports |
 |--------|--------------|-------------|
-| `main.py` | CLI entry point, ELF validation, `--no-sandbox` gate, session/recorder lifecycle. | `build_parser()`, `main()` |
-| `src/config.py` | User-editable defaults for display, stepping, recording, and mapping caps. | `VIEW_PAGE_SIZE`, `MAX_MAP_FOLDER_MB`, etc. |
+| `main.py` | CLI entry point, ELF validation, `--no-sandbox` gate, session/recorder lifecycle, `--map` / `-m` dispatch. | `build_parser()`, `main()` |
+| `src/config.py` | Central configuration constants for register formats, prompt components, live view defaults, record context, external call skipping, stack trimming, and mapper caps. | `VIEW_PAGE_SIZE`, `MAX_MAP_FOLDER_MB`, etc. |
 | `src/elf_utils.py` | Zero-dependency ELF32/ELF64 binary & symbol parser and address translator. | `ElfInfo`, `parse_elf()`, `parse_address_input()`, `resolve_target_address()` |
 | `src/sandbox.py` | Architecture matching, `bwrap` container builder, QEMU detection, host confirmation. | `SandboxEnv`, `confirm_disable_sandbox()`, `detect_host_arch()`, `needs_qemu()` |
-| `src/mi_protocol.py` | Raw `bufsize=0` GDB/MI2 pipe driver, recursive MI2 parser, target `stdin` FIFO. | `MIProtocol`, `MIParser`, `parse_mi_lines()` |
-| `src/gdb_inspector.py` | Fast indexed register queries, memory/C-string inspection, Intel disassembly, stack bounds. | `GdbInspectorMixin`, `trim_zero_stack()`, `CORE_REGS` |
-| `src/gdb_session.py` | Execution orchestration, PIE base discovery, `call`, `jump`, `ignore`, external skipping. | `GdbSession`, `IgnoreCallManager` |
-| `src/formatters.py` | Register/stack/disas formatters, prompt generator, `readline` Tab completer, `help`. | `format_reg_line()`, `setup_readline_completer()`, `handle_ignore_command()` |
-| `src/colors.py` | Optional `colorama` TTY-only highlighting, ANSI-aware padding, byte-level stack diffs. | `colors_active()`, `highlight_char_diff()`, `format_diff_xxd_line()`, `visible_len()` |
-| `src/live_view.py` | Flicker-free single-flush live dashboard, wide-screen split layout, `nestN` panes. | `run_live_view()`, `parse_view_options()`, `select_visible_frames()` |
-| `src/cli.py` | Interactive REPL loop, `ls`/`lsN`, batch step-dumping, stack preview/less/dump. | `run_interactive_cli()`, `handle_ls_command()`, `handle_step_with_dump()` |
-| `src/recorder.py` | Idle-flushed session recorder writing full active stack & per-function logs. | `SessionRecorder` |
-| `src/mapper.py` | Autonomous execution & syscall mapper with 250 MB size cap and European timestamps. | `run_execution_mapper()`, `classify_instruction()`, `FolderSizeGuard` |
+| `src/mi_protocol.py` | Raw `bufsize=0` GDB/MI2 pipe driver, recursive MI2 parser, target `stdin` FIFO, accumulated `stdout` storage. | `MIProtocol`, `MIParser`, `parse_mi_lines()` |
+| `src/gdb_inspector.py` | Fast indexed register queries, memory/C-string inspection, Intel opcode disassembly, `ls` context slicing, binary-only function listing, and zero-trimmed stack dumps. | `GdbInspectorMixin`, `trim_zero_stack()`, `CORE_REGS` |
+| `src/gdb_session.py` | Process lifecycle (`_start` vs `main`), PIE runtime base discovery, `goto_address`, `jump_to_target`, `run_to_next_call`, `IgnoreCallManager`, proactive/stalled `stdin` prompting, and `.plt`/external skipping. | `GdbSession`, `IgnoreCallManager` |
+| `src/formatters.py` | Character-level register diff formatting, `xxd`-style stack lines, `readline` Tab autocompleter, prompt builder, `ignore` command parser, and complete `help` reference. | `format_reg_line()`, `setup_readline_completer()`, `handle_ignore_command()`, `print_help()` |
+| `src/colors.py` | Optional `colorama` wrapper constrained strictly to interactive TTYs (`sys.stdout.isatty()`), providing ANSI-aware width alignment (`visible_len`) and byte-level `xxd` diffs. | `colors_active()`, `highlight_char_diff()`, `format_diff_xxd_line()`, `visible_len()` |
+| `src/live_view.py` | Flicker-free single-flush ANSI dashboard with wide-screen split layout, `max`/`min`/`only`/`raw stack` modes, zero-collapsed active stack, live format toggles, and `nestN` caller/callee panes. | `run_live_view()`, `parse_view_options()`, `select_visible_frames()` |
+| `src/cli.py` | Interactive command REPL supporting all navigation, stepping, batch-dumping, inspection, stack, and recording hooks. | `run_interactive_cli()`, `handle_ls_command()`, `handle_step_with_dump()` |
+| `src/recorder.py` | Idle-flushed session recorder writing `record-<bin>_<date>/full_recording.txt` and `functions/func_*.txt` strictly during idle prompt waits. | `SessionRecorder` |
+| `src/mapper.py` | Autonomous execution mapper generating `<bin>-mapped_<date>/` with instruction traces, active stack snapshots & diffs, syscall logs, and aggregate statistics under a hard `250 MB` limit. | `run_execution_mapper()`, `classify_instruction()`, `FolderSizeGuard` |
 
 ---
 
@@ -124,8 +125,8 @@ Raw GDB is built for source-level C/C++ debugging with full DWARF symbols. When 
 Handles GDB/MI2 async records (`*stopped`, `=thread-*`), result records (`^done`, `^running`, `^error`), console streams (`~"..."`), target streams (`@"..."`), nested tuples (`{...}`), lists (`[...]`), and escaped C-strings.
 
 ### Target `stdout` & `stdin` Isolation
-- **Target `stdout`:** In pipe mode without a PTY, GDB emits target `stdout` as `raw` lines alongside MI records. `parse_mi_lines()` captures both `@"..."` and `raw` lines into `target_output_buffer` (for per-step display) and `all_target_output` (retained across the full run for `EXITED` screens), splitting any target output lacking a trailing `\n` via `MI_EMBEDDED_RE`.
-- **Target `stdin` FIFO:** `setup_target_stdin_fifo()` creates a named pipe in `work_dir` (`/tmp/work/target_stdin` inside Bubblewrap), opened `O_RDWR | O_NONBLOCK` on the host so Python keeps a writer open without blocking and feeds lines cleanly to `fgets`/`scanf`/`read(0)` via `-exec-arguments ... < /tmp/work/target_stdin`.
+- **Target `stdout`:** In pipe mode without a PTY, GDB passes inferior `stdout` directly through the pipe. `parse_mi_lines()` captures both `@"..."` and `raw` lines into `target_output_buffer` (for per-step display) and `all_target_output` (retained across the full run for `EXITED` screens), splitting any target text lacking a trailing newline via `MI_EMBEDDED_RE`.
+- **Target `stdin` FIFO:** `setup_target_stdin_fifo()` creates a named pipe in `work_dir` (`/tmp/work/target_stdin` inside Bubblewrap), opened `O_RDWR | O_NONBLOCK` on the host so Python keeps a writer open without blocking and feeds lines cleanly to `fgets`/`scanf`/`read(0)` via `-exec-arguments ... < /tmp/work/target_stdin`. Target input calls block cleanly on the FIFO without colliding with GDB's MI2 command stream.
 
 ---
 
@@ -187,7 +188,7 @@ Avoiding `\033[2J` on redraws eliminates blank-frame flicker even while holding 
 - Each frame caches its instruction window in `frame_pages[idx]` and refreshes only when `PC` exits the cached page or when `force_refresh` is triggered (`size`, `nest`, `jump`, `main`, `start`, `call`, `0x...`).
 
 ### Wide-Screen Layout & Byte/Char Diffs
-- When `term_cols >= VIEW_SPLIT_MIN_COLS` (`125`), `render_two_columns()` aligns panes side-by-side using `visible_len()` and `pad_visible()` so ANSI SGR codes never shift the `|` separator.
+- When `term_cols >= VIEW_SPLIT_MIN_COLS` (`125`), `render_two_columns()` places Code (+ Registers if Stack is also active) on the left pane and Stack/Registers on the right pane separated by `|`.
 - `highlight_char_diff()` colors only changed characters in `[REGISTERS]`.
 - `format_diff_xxd_line()` compares each byte address against `prev_stack_bytes: dict[int, int]` (surviving 8-byte `SP` shifts intact) and colors only changed bytes in both the hex and ASCII columns.
 - `colors_active()` enforces `ENABLE_COLORS and _HAS_COLORAMA and sys.stdout.isatty()`, guaranteeing zero ANSI escape leakage when piped to files or clipboards.
@@ -214,11 +215,14 @@ Avoiding `\033[2J` on redraws eliminates blank-frame flicker even while holding 
 
 ## 11. Autonomous Execution Mapping & Syscall Tracing (`src/mapper.py`)
 
-`run_execution_mapper()` records a complete execution profile under `<binary>-mapped_<DD-MM-YYYY_HH-MM-SS>/`:
+`run_execution_mapper()` records an autonomous execution profile under `<binary>-mapped_<DD-MM-YYYY_HH-MM-SS>/`:
 1. Advances to `--func`, `main` (`-m`), or `_start` *before* enabling `catch syscall`.
 2. When `--func` is specified, tracks call depth (`func_depth`) across `call` and `ret` instructions and halts cleanly when the target invocation returns.
-3. Skips external shared-library instructions via `step_over_or_finish_external(..., on_syscall=record_syscall_event)`, capturing syscalls triggered inside `libc` (such as `write`, `newfstatat`, `brk`, and non-returning `exit_group`).
-4. Classifies instructions (`jump`, `call`, `ret`, `mem`) via `classify_instruction()`, samples `VmHWM` peak memory from `info proc status`, and enforces `MAX_MAP_FOLDER_MB` (`250` MB) via `FolderSizeGuard`.
+3. **Active Stack Snapshots & Diffs:** Unlike raw instruction tracers, `full_trace.txt` logs `FULL ACTIVE STACK` on function entries and `STACK CHANGED` rows on modifying steps, matching the structured format of `--record`.
+4. **Interactive Target `stdin`:** If the binary calls `fgets`/`scanf`/`read` during `--map`, `mapper.py` routes through `prompt_for_target_stdin()` and feeds lines cleanly via the FIFO without hanging.
+5. **Syscall Interception:** Steps through main-binary code while forwarding `syscall-entry`/`syscall-return` events inside `libc` via `on_syscall`, flushing any final non-returning syscall (`exit_group`) on process exit.
+6. **Graceful Interrupts:** Pressing `Ctrl+C` halts tracing cleanly, flushes the final syscall record, and writes `summary.txt` with `Interrupted By User : YES`.
+7. **Size Cap Enforcement:** Classifies instructions (`jump`, `call`, `ret`, `mem`) via `classify_instruction()`, samples `VmHWM` peak memory from `info proc status`, and enforces `MAX_MAP_FOLDER_MB` (`250` MB) via `FolderSizeGuard`.
 
 ---
 
@@ -235,7 +239,7 @@ Host Filesystem                       Bubblewrap Sandbox (/tmp/work)
 ```
 
 - **Native Debugging:** Runs `gdb --interpreter=mi2` directly inside `bwrap --unshare-all --cap-drop ALL --new-session --die-with-parent --clearenv`, keeping `gdb` as the direct parent of the inferior so `ptrace` operates cleanly under `yama.ptrace_scope=1`.
-- **Cross-Architecture Emulation:** When `needs_qemu(host_arch, target_arch)` is `True` (e.g., `aarch64`/`arm` on `x86_64`), a sandboxed shell wrapper spawns `qemu-<arch> -g <port> target_bin < target_stdin` and connects `gdb-multiarch` to `127.0.0.1:<port>` inside the sandbox.
+- **Cross-Architecture Emulation:** When `needs_qemu(host_arch, elf.arch)` is `True` (e.g., `aarch64`/`arm` on `x86_64`), a sandboxed shell wrapper spawns `qemu-<arch> -g <port> target_bin < target_stdin` and connects `gdb-multiarch` to `127.0.0.1:<port>` inside the sandbox.
 - **`--no-sandbox` Safety Gate:** `confirm_disable_sandbox()` displays a prominent warning and requires two confirmations followed by matching `"iknow"` (case- and whitespace-insensitive) before executing directly on the host.
 
 ---
