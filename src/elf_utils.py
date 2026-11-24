@@ -27,8 +27,16 @@ EM_AARCH64 = 183
 
 PT_LOAD = 1
 PF_X = 1
+PF_W = 2
 
+SHT_NULL = 0
+SHT_PROGBITS = 1
 SHT_SYMTAB = 2
+SHT_STRTAB = 3
+SHF_WRITE = 1
+SHF_ALLOC = 2
+SHF_EXECINSTR = 4
+
 STT_FUNC = 2
 
 MACHINE_MAP = {
@@ -51,6 +59,10 @@ class LoadSegment:
     def is_executable(self) -> bool:
         return bool(self.flags & PF_X)
 
+    @property
+    def is_writable(self) -> bool:
+        return bool(self.flags & PF_W)
+
 
 @dataclass
 class ElfInfo:
@@ -67,6 +79,7 @@ class ElfInfo:
     text_range: tuple[int, int] | None = None
     plt_ranges: list[tuple[int, int]] = field(default_factory=list)
     functions: list[str] = field(default_factory=list)
+    is_sstripped: bool = False
 
     def contains_vaddr(self, addr: int) -> bool:
         for seg in self.segments:
@@ -80,6 +93,12 @@ class ElfInfo:
                 return seg.vaddr + (offset - seg.offset)
         return None
 
+    def vaddr_to_file_offset(self, vaddr: int) -> int | None:
+        for seg in self.segments:
+            if seg.vaddr <= vaddr < seg.vaddr + seg.filesz:
+                return seg.offset + (vaddr - seg.vaddr)
+        return None
+
 
 def _read_cstr(buf: bytes, offset: int) -> str:
     if offset < 0 or offset >= len(buf):
@@ -88,6 +107,138 @@ def _read_cstr(buf: bytes, offset: int) -> str:
     if end == -1:
         end = len(buf)
     return buf[offset:end].decode("ascii", errors="replace")
+
+
+def resolve_entry_main_address(elf: ElfInfo) -> int | None:
+    """
+    On stripped / sstripped binaries without symbols, inspects machine code at _start
+    (e_entry) to find the address of main() passed to __libc_start_main.
+    """
+    raw = elf.path.read_bytes()
+    entry_off = elf.vaddr_to_file_offset(elf.e_entry)
+    if entry_off is None or entry_off + 64 > len(raw):
+        return None
+
+    chunk = raw[entry_off:entry_off + 64]
+
+    # x86-64: `lea rdi, [rip + disp32]` (48 8d 3d xx xx xx xx)
+    if elf.arch == "x86_64":
+        idx = chunk.find(b"\x48\x8d\x3d")
+        if idx != -1 and idx + 7 <= len(chunk):
+            disp = struct.unpack(elf.endian + "i", chunk[idx + 3:idx + 7])[0]
+            next_insn_vaddr = elf.e_entry + idx + 7
+            return next_insn_vaddr + disp
+
+    # i386: `push imm32` (68 xx xx xx xx) followed by call __libc_start_main
+    elif elf.arch == "i386":
+        for i in range(len(chunk) - 5):
+            if chunk[i] == 0x68 and i + 10 <= len(chunk) and (chunk[i + 5] == 0xE8 or chunk[i + 5:i + 7] == b"\xFF\x15"):
+                return struct.unpack(elf.endian + "I", chunk[i + 1:i + 5])[0]
+
+    return None
+
+
+def reconstruct_sstripped_sections(target_bin: Path, elf: ElfInfo) -> bool:
+    """
+    If a binary was stripped with `sstrip` (e_shoff == 0 or e_shnum == 0), GDB crashes
+    or refuses to disassemble because BFD requires section headers.
+    This reconstructs a valid .text, .data, and .shstrtab section table from the PT_LOAD
+    segments and appends it to target_bin (modifying only the sandboxed temporary file).
+    """
+    raw = bytearray(target_bin.read_bytes())
+    if len(raw) < 64:
+        return False
+
+    # Find executable PT_LOAD (text) and writable PT_LOAD (data)
+    text_seg = next((s for s in elf.segments if s.is_executable), None)
+    data_seg = next((s for s in elf.segments if s.is_writable), None)
+    if not text_seg:
+        return False
+
+    shstrtab = b"\x00.text\x00.data\x00.shstrtab\x00"
+    str_text_off = 1
+    str_data_off = 7
+    str_shstrtab_off = 13
+
+    # Align to 8 bytes
+    pad = (8 - (len(raw) % 8)) % 8
+    raw.extend(b"\x00" * pad)
+
+    shstrtab_off = len(raw)
+    raw.extend(shstrtab)
+
+    pad2 = (8 - (len(raw) % 8)) % 8
+    raw.extend(b"\x00" * pad2)
+
+    shoff = len(raw)
+    endian = elf.endian
+
+    if elf.bits == 64:
+        shentsize = 64
+        # Section 0: NULL
+        sec0 = bytes(64)
+        # Section 1: .text
+        sec1 = struct.pack(
+            endian + "IIQQQQIIQQ",
+            str_text_off, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
+            text_seg.vaddr, text_seg.offset, text_seg.filesz,
+            0, 0, 16, 0
+        )
+        # Section 2: .data
+        data_vaddr = data_seg.vaddr if data_seg else 0
+        data_off = data_seg.offset if data_seg else 0
+        data_sz = data_seg.filesz if data_seg else 0
+        sec2 = struct.pack(
+            endian + "IIQQQQIIQQ",
+            str_data_off, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE,
+            data_vaddr, data_off, data_sz,
+            0, 0, 8, 0
+        )
+        # Section 3: .shstrtab
+        sec3 = struct.pack(
+            endian + "IIQQQQIIQQ",
+            str_shstrtab_off, SHT_STRTAB, 0,
+            0, shstrtab_off, len(shstrtab),
+            0, 0, 1, 0
+        )
+        raw.extend(sec0 + sec1 + sec2 + sec3)
+        # Patch ELF64 header: e_shoff (offset 40, 8 bytes), e_shentsize (58, 2), e_shnum (60, 2), e_shstrndx (62, 2)
+        struct.pack_into(endian + "Q", raw, 40, shoff)
+        struct.pack_into(endian + "H", raw, 58, shentsize)
+        struct.pack_into(endian + "H", raw, 60, 4)
+        struct.pack_into(endian + "H", raw, 62, 3)
+    else:
+        shentsize = 40
+        sec0 = bytes(40)
+        sec1 = struct.pack(
+            endian + "IIIIIIIIII",
+            str_text_off, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
+            text_seg.vaddr, text_seg.offset, text_seg.filesz,
+            0, 0, 16, 0
+        )
+        data_vaddr = data_seg.vaddr if data_seg else 0
+        data_off = data_seg.offset if data_seg else 0
+        data_sz = data_seg.filesz if data_seg else 0
+        sec2 = struct.pack(
+            endian + "IIIIIIIIII",
+            str_data_off, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE,
+            data_vaddr, data_off, data_sz,
+            0, 0, 8, 0
+        )
+        sec3 = struct.pack(
+            endian + "IIIIIIIIII",
+            str_shstrtab_off, SHT_STRTAB, 0,
+            0, shstrtab_off, len(shstrtab),
+            0, 0, 1, 0
+        )
+        raw.extend(sec0 + sec1 + sec2 + sec3)
+        struct.pack_into(endian + "I", raw, 32, shoff)
+        struct.pack_into(endian + "H", raw, 46, shentsize)
+        struct.pack_into(endian + "H", raw, 48, 4)
+        struct.pack_into(endian + "H", raw, 50, 3)
+
+    target_bin.write_bytes(raw)
+    return True
 
 
 def parse_elf(path: Path) -> ElfInfo:
@@ -157,6 +308,7 @@ def parse_elf(path: Path) -> ElfInfo:
     text_range: tuple[int, int] | None = None
     plt_ranges: list[tuple[int, int]] = []
     section_headers: list[tuple[int, int, int, int, int, int, int]] = []
+    is_sstripped = (e_shoff == 0 or e_shnum == 0)
 
     if e_shoff and e_shnum:
         for i in range(e_shnum):
@@ -205,6 +357,13 @@ def parse_elf(path: Path) -> ElfInfo:
                         functions_set.add(fn_name)
                 pos += sh_entsize
 
+    # If sstripped without section table, synthesize text_range from executable PT_LOAD
+    if is_sstripped:
+        for s in segments:
+            if s.is_executable:
+                text_range = (s.vaddr, s.vaddr + s.filesz)
+                break
+
     user_fns = sorted(f for f in functions_set if not f.startswith("_"))
     internal_fns = sorted(f for f in functions_set if f.startswith("_"))
 
@@ -223,6 +382,7 @@ def parse_elf(path: Path) -> ElfInfo:
         text_range=text_range,
         plt_ranges=plt_ranges,
         functions=user_fns + internal_fns,
+        is_sstripped=is_sstripped,
     )
 
 

@@ -1,6 +1,6 @@
 # `bin-debug-friendly`
 
-> **A fast, Bubblewrap-sandboxed Linux ELF debugger, stationary live-arrow TUI, and execution mapper with exact `objdump`-style hex addressing, byte-level green memory/register diffs, nested call windows, smart stack dumps, and cross-architecture QEMU support.**
+> **A fast, Bubblewrap-sandboxed Linux ELF debugger, stationary live-arrow TUI, execution mapper, lifecycle heap dumper, and dynamic stack/register string extractor—built to shred any runnable ELF binary (even stripped & `sstrip`ped) into clean, human-readable intelligence.**
 
 **⚠️ PLATFORM SUPPORT: LINUX ONLY.**  
 *`bin-debug-friendly` relies on Linux kernel namespaces (`bubblewrap`), `/proc/<pid>/maps` memory introspection, named FIFOs, ELF32/ELF64 binary parsing, GNU `gdb`, and optional `qemu-user` emulation.*  
@@ -12,91 +12,81 @@
 ## Table of Contents
 
 1. [Why `bin-debug-friendly`?](#1-why-bin-debug-friendly)
-2. [Key Features at a Glance](#2-key-features-at-a-glance)
-3. [Synopsis & Launch Flags](#3-synopsis--launch-flags)
+2. [You Can't Hide From This Suite](#2-you-cant-hide-from-this-suite)
+3. [The Three-Tool Arsenal](#3-the-three-tool-arsenal)
 4. [Quick Start & Prerequisites](#4-quick-start--prerequisites)
-5. [Direct Exact-Address Debugging (No `main+offset` Math)](#5-direct-exact-address-debugging-no-mainoffset-math)
-6. [Complete Interactive Command Reference](#6-complete-interactive-command-reference)
-7. [Live View (`view`) & Nested Call Windows (`nestN`)](#7-live-view-view--nested-call-windows-nestn)
-8. [Call Navigation (`call <func>`) & Call Ignoring (`ignore`)](#8-call-navigation-call-func--call-ignoring-ignore)
-9. [Interactive `stdin` (`fgets` / `scanf` / `read`)](#9-interactive-stdin-fgets--scanf--read)
-10. [Smart Zero-Trimmed Stack Inspection & Dumping](#10-smart-zero-trimmed-stack-inspection--dumping)
-11. [Session Recording (`--record`)](#11-session-recording---record)
-12. [Autonomous Execution Mapping (`--map` & `--func`)](#12-autonomous-execution-mapping---map--func)
-13. [Configuration (`src/config.py`)](#13-configuration-srcconfigpy)
-14. [Security Model (Bubblewrap Sandbox & `--no-sandbox`)](#14-security-model-bubblewrap-sandbox----no-sandbox)
-15. [Cross-Architecture Debugging (QEMU + ARM / AArch64 / x86)](#15-cross-architecture-debugging-qemu--arm--aarch64--x86)
-16. [Real-World Reverse Engineering Walkthroughs](#16-real-world-reverse-engineering-walkthroughs)
-17. [Running the Test Suite](#17-running-the-test-suite)
-18. [License](#license)
+5. [Synopsis & Launch Flags (`main.py`)](#5-synopsis--launch-flags-mainpy)
+6. [Direct Exact-Address Debugging (Zero `main+offset` Math)](#6-direct-exact-address-debugging-zero-mainoffset-math)
+7. [Complete Interactive Command Reference](#7-complete-interactive-command-reference)
+8. [Live View (`view`) & Nested Call Windows (`nestN`)](#8-live-view-view--nested-call-windows-nestn)
+9. [Call Navigation (`call <func>`) & Call Ignoring (`ignore`)](#9-call-navigation-call-func--call-ignoring-ignore)
+10. [Interactive `stdin` (`fgets` / `scanf` / `read`)](#10-interactive-stdin-fgets--scanf--read)
+11. [Smart Zero-Trimmed Stack Inspection & Dumping](#11-smart-zero-trimmed-stack-inspection--dumping)
+12. [Session Recording (`--record`) & Register Dereferencing (`DEREF`)](#12-session-recording---record--register-dereferencing-deref)
+13. [Autonomous Execution Mapping (`--map` & `--func`)](#13-autonomous-execution-mapping---map--func)
+14. [Lifecycle Heap Dumper (`heap_dump.py`)](#14-lifecycle-heap-dumper-heap_dumppy)
+15. [Dynamic Stack & Register String Extractor (`stack_strings.py`)](#15-dynamic-stack--register-string-extractor-stack_stringspy)
+16. [Safety Limits, Timeouts & Graceful Interrupts](#16-safety-limits-timeouts--graceful-interrupts)
+17. [Configuration Reference (`src/config.py`)](#17-configuration-reference-srcconfigpy)
+18. [Security Model (Bubblewrap Sandbox & `--no-sandbox`)](#18-security-model-bubblewrap-sandbox----no-sandbox)
+19. [Cross-Architecture Debugging (QEMU + ARM / AArch64 / x86)](#19-cross-architecture-debugging-qemu--arm--aarch64--x86)
+20. [Real-World Reverse Engineering Walkthroughs](#20-real-world-reverse-engineering-walkthroughs)
+21. [Running the Test Suite](#21-running-the-test-suite)
+22. [License](#license)
 
 ---
 
 ## 1. Why `bin-debug-friendly`?
 
-Have you ever copied an address like `0x1149` straight out of `objdump`, `binpatch`, `readelf`, or a hex dump—and then watched raw GDB fight you every step of the way?
+Have you ever copied an address like `0x1149` straight out of `objdump`, `binpatch`, `readelf`, or a hex dump—only to watch raw GDB fight you every single step of the way?
 
 In plain GDB:
-- Setting a breakpoint on a PIE binary means manually calculating `runtime_base + 0x1149` or typing annoying `b *main+0x12` expressions.
-- Stepping casually drops you straight into `puts@plt`, `_dl_runtime_resolve`, and hundreds of lines of `ld-linux.so` and `libc` internals.
-- Register dumps show only raw hex unless you manually cast and print memory strings one register at a time.
-- Dumping `[stack]` writes out `135 KB` of mostly `0x00` guard space instead of your actual active stack frames.
-- Watching a crackme decode a password or fill a stack buffer requires constantly re-typing `x/32bx $rsp`, `i r`, and `disas` over and over as your terminal scrolls away.
+- Debugging a PIE binary means manually calculating `runtime_base + 0x1149` or typing `b *main+0x12`.
+- Stepping casually drops you inside `puts@plt`, `_dl_runtime_resolve`, and hundreds of lines of `ld-linux.so` and `libc` internals.
+- Register dumps show raw hex without showing whether `RDI` or `RDX` points to `"letmein123"` or `"Wrong."`.
+- Dumping `[stack]` writes `135 KB` of empty `0x00` guard memory instead of your active stack frames.
+- Feeding `fgets` / `scanf` inside a debugger turns into messy TTY collisions.
+- Static `strings binary` finds **nothing** when a binary decrypts its secrets onto the stack or heap at runtime.
+- Feeding an **`sstrip`ped** binary (where all section headers are deleted) makes standard disassemblers and debuggers crash or refuse to work.
 
-**`bin-debug-friendly`** solves all of this out of the box:
-- **Exact `objdump` addresses everywhere:** Copy `0x12c4` (or `12c4`, or `" 0x 12 c4 "`) straight from disassembly and type `0x12c4` or `stop 0x12c4`—PIE rebasing happens automatically.
-- **Intel syntax locked in:** Clean `objdump`-style Intel disassembly with raw hex opcodes and rebased target comments (`# 0x2004`, `call 0x1030 <puts@plt>`).
-- **Stationary Live `view`:** A flicker-free dashboard where your code stays locked in place while only the `=>` arrow walks down, your registers update live in all formats (`hex | dec | char | str`), and changed characters & stack bytes light up **bright green** right beside the code.
-- **Built-in execution mapper & session recorder:** Trace every main-binary instruction, active stack diff, and system call into clean, structured text folders (`--map`), or record your interactive debugging steps for later human or AI analysis (`--record`).
-- **Sandboxed by default:** Every target binary executes inside an air-gapped **Bubblewrap (`bwrap`)** container with `/home` hidden and zero internet access.
+**`bin-debug-friendly` replaces all of that pain with a fast, unified, human-friendly reverse-engineering workflow.**  
+If an ELF binary is valid and can run on Linux, you can debug it, record it, map it, dump its stack, snapshot its heap, extract its runtime strings, and tear it apart—even if it was stripped down to the bone with `strip --strip-all` or `sstrip`, or compiled into a sub-1 KB custom syscall ELF binary.
 
 ---
 
-## 2. Key Features at a Glance
+## 2. You Can't Hide From This Suite
 
-* **Pure-Python ELF32 & ELF64 Engine:** Detects architecture (`x86_64`, `i386`, `aarch64`, `arm`), endianness, bitness, PIE (`ET_DYN`) vs fixed (`ET_EXEC`), `.text` bounds, `.plt*` trampoline ranges, and `.symtab` binary function names with zero external tools.
-* **Sub-Millisecond Stepping:** Indexed register queries pull only the 18 core architecture registers (skipping 150+ AVX-512/FPU vectors), while `PC` is extracted directly from GDB stop frames and `[stack]` bounds are cached.
-* **Stationary Wide-Screen `view` + `nestN`:** Displays 41 lines of code, `all`-format registers, and a zero-collapsed active `[STACK]` side-by-side on wide monitors (`>= 125` cols), plus `nest1`..`nestN` stacked caller/callee code windows.
-* **Exact Green Diffs (`src/colors.py`):** Highlights only the exact changed hex/decimal/ASCII characters in `[REGISTERS]` and only the exact changed bytes in `[STACK]` (auto-disabled cleanly when `colorama` is absent or stdout is piped to a file/clipboard).
-* **Smart `call <func> [--ignore]` + Tab Autocomplete:** Autocompletes strictly from your binary's `.symtab` and `.text`/`.plt` calls (never polluted with `libc` symbols), runs to the upcoming call site, and steps straight inside.
-* **Granular Call Ignoring:** `ignore call`, `ignore once`, `ignore call N`, `ignore nest`, and `unignore call`.
-* **Non-Colliding Target `stdin`:** Dedicated sandboxed FIFO handles `fgets`, `scanf`, `getchar`, `getline`, and `read` cleanly—flushing held Enter keys and prompting you seamlessly without corrupting GDB's control pipe (works in interactive CLI, `view`, and `--map`!).
-* **Zero-Trimmed `.stack.bin` Dumps:** Dumps only the active stack (`SP` upward) stripped of empty guard zeros, ready immediately for `xxd`.
-* **Session Recording (`--record`) & Execution Mapping (`--map`):** Clean, structured, predictable non-JSON output folders with European 24-hour timestamps (`DD-MM-YYYY HH:MM:SS`).
+Crackmes, CTFs, obfuscated tools, and malware try every trick in the book to hide secrets from static analysis. Here is how **`bin-debug-friendly`** defeats each layer automatically:
+
+| Anti-Analysis / Hiding Trick | How `bin-debug-friendly` Defeats It |
+| :--- | :--- |
+| **PIE / ASLR randomization** | Automatically discovers runtime base via `/proc/<pid>/maps` / `auxv` and translates `objdump` offsets back and forth transparently. |
+| **Stack-constructed / XOR-decoded secrets** | `view` lights up changed stack bytes **green** in real time; `--record` and `--map` log stack diffs; `stack_strings.py` catches secrets materializing byte-by-byte (`crac` $\rightarrow$ `crackme123`). |
+| **Heap-only allocation (`malloc`, never touches stack)** | `heap_dump.py` freezes execution at `sys_read` (`fd == 0`) and dumps `[heap]` immediately, revealing heap-only buffers like `letmein123`. |
+| **Just-in-time decode *after* `fgets` + `explicit_bzero` / `free` wipe** | `heap_dump.py` installs post-`stdin` traps on `strcmp`, `strncmp`, `memcmp`, `explicit_bzero`, `free`, and `exit_group`—snapshotting `[heap]` *before* the wipe (up to `16` distinct states). |
+| **Register-only pointer passing** | `--map` and `--record` automatically check every GPR (`>= 0x1000`) for printable C-strings and log `DEREF: RDI->'letmein123'`; `stack_strings.py` sweeps them all up *(note: coincidental short ASCII runs inside GOT/libc pointers like `@QUUUU` also appear alongside real strings)*. |
+| **`strip --strip-all` & `sstrip` (zero section headers)** | Reconstructs synthetic `.text`, `.data`, and `.shstrtab` sections past the last `PT_LOAD` segment in the sandboxed copy so GDB never crashes; recovers `main()` statically from `_start` on `x86_64` (`lea rdi, [rip+disp32]`) and `i386` (`push imm32` before `call`), and traps `main` dynamically via `X0`/`R0` when stepping `_start` on `aarch64`/`arm`. |
 
 ---
 
-## 3. Synopsis & Launch Flags
+## 3. The Three-Tool Arsenal
 
-```bash
-python3 main.py <binary> [target_args...] [OPTIONS]
-```
-
-| Flag | Argument | Description |
-|------|----------|-------------|
-| `-m`, `-main`, `--main` | *(none)* | Start and automatically pause at `main()`. Also pairs with `--map` to map from `main()` forward! Errors out cleanly without starting if the binary is stripped or has no `main` symbol. |
-| `-record`, `--record` | *(none)* | Record every interactive command, timing, disassembly context, register diff, full active stack, and `stdout` into `record-<bin>_<DD-MM-YYYY_HH-MM-SS>/`. |
-| `-map`, `--map` | *(none)* | Run autonomous execution mapper: traces instructions, register states, active stack snapshots & diffs, system calls, and stats into `<bin>-mapped_<DD-MM-YYYY_HH-MM-SS>/`. |
-| `-func`, `--func`, `--function` | `ADDR\|SYM` | With `--map`: start tracing when `ADDR` or `SYM` is entered and automatically stop when it returns. |
-| `--dump-stack-syscalls` | *(none)* | With `--map`: save binary `.stack.bin` snapshots on every system call entry. |
-| `--no-sandbox` | *(none)* | Disable Bubblewrap isolation and debug directly on the host (triggers a full-screen warning and 3-step confirmation requiring `"I know"`). |
-
-### Default Entry Behavior
-- Running `python3 main.py ./binary` (without `-m`) automatically skips dynamic linker (`ld-linux.so`) startup and pauses cleanly at the binary's real entry point (`_start`), ready for inspection even on stripped binaries.
-- Running `python3 main.py ./binary -m` verifies that `main` exists and pauses directly on `main()`.
+1. **`main.py`** — The core Bubblewrap-sandboxed ELF debugger, stationary live-arrow `view` dashboard, session recorder (`--record`), and autonomous execution/syscall mapper (`--map`).
+2. **`heap_dump.py`** — Standalone lifecycle heap dumper that catches `[heap]` snapshots before `stdin` reads and right before `strcmp`/`explicit_bzero`/`free`/`exit_group` wipes—working even on `sstrip`ped binaries.
+3. **`stack_strings.py`** — Standalone string extractor that reconstructs all chronological stack states and `DEREF:` register targets from any `--record` or `--map` folder into a unified binary stream and deduplicated timeline.
 
 ---
 
 ## 4. Quick Start & Prerequisites
 
 ### System Requirements (Linux Only)
-* **Python 3.10+** (standard library only—no `pip` packages required)
+* **Python 3.10+** (standard library only—zero mandatory `pip` packages)
 * **GNU `gdb`**
 * **`bubblewrap` (`bwrap`)** — mandatory for sandboxed execution
 * **Optional:**
-  * `colorama` — enables bright-green byte/character change highlights in interactive terminals
-  * `qemu-user` + `gdb-multiarch` — enables debugging ARM / AArch64 / 32-bit x86 binaries across architectures
-  * `xxd` and `less` — for inspecting `.stack.bin` dumps and `stack less`
+  * `colorama` — enables bright-green byte/character change highlights in interactive TTYs
+  * `qemu-user` + `gdb-multiarch` — enables cross-architecture debugging (`aarch64`, `arm`, `i386`)
+  * `xxd` and `less` — for inspecting `.stack.bin` / `heap.bin` dumps and `stack less`
 
 ### Install Dependencies
 
@@ -112,17 +102,36 @@ sudo apt update && sudo apt install -y python3 gdb bubblewrap
 sudo apt install -y python3-colorama qemu-user gdb-multiarch
 ```
 
-### First Run
+### Make Scripts Executable
 ```bash
-chmod +x main.py
-python3 main.py ./your_binary
+chmod +x main.py heap_dump.py stack_strings.py
 ```
 
 ---
 
-## 5. Direct Exact-Address Debugging (No `main+offset` Math)
+## 5. Synopsis & Launch Flags (`main.py`)
 
-Whether your binary is compiled with **PIE (`-fPIE -pie`, the modern GCC default)** or **`-no-pie`**, `bin-debug-friendly` lets you use the exact addresses printed by `objdump`, `binpatch`, `readelf`, or `xxd`.
+```bash
+python3 main.py <binary> [target_args...] [OPTIONS]
+```
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `-m`, `-main`, `--main` | *(none)* | Start and automatically pause at `main()`. Supports symbol-rich binaries across all architectures, plus stripped/`sstrip`ped binaries on `x86_64` and `i386` (via `_start` recovery). Also pairs with `--map` to map from `main()` forward. |
+| `-record`, `--record` | *(none)* | Record every interactive command, timing, disassembly context, register diff, register dereferences (`DEREF`), full active stack, and `stdout` into `record-<bin>_<DD-MM-YYYY_HH-MM-SS>/`. |
+| `-map`, `--map` | *(none)* | Run autonomous execution mapper: traces instructions, GPRs, `DEREF:` strings, active stack snapshots & diffs, system calls, and stats into `<bin>-mapped_<DD-MM-YYYY_HH-MM-SS>/`. |
+| `-func`, `--func`, `--function` | `ADDR\|SYM` | With `--map`: start tracing when `ADDR` or `SYM` is entered and automatically stop when it returns. |
+| `--dump-stack-syscalls` | *(none)* | With `--map`: save binary `.stack.bin` snapshots (`syscall_NNNN_<name>.stack.bin`) on every system call entry. |
+| `--no-sandbox` | *(none)* | Disable Bubblewrap isolation and debug directly on the host (triggers a full-screen warning and 3-step confirmation: two yes/no prompts followed by typing `"I know"`). |
+
+### Default Entry Behavior
+- Running `python3 main.py ./binary` (without `-m`) automatically skips `ld-linux.so` loader noise and pauses cleanly at the binary's real entry point (`_start`), ready for inspection even on stripped, `sstrip`ped, or raw custom-syscall binaries.
+
+---
+
+## 6. Direct Exact-Address Debugging (Zero `main+offset` Math)
+
+Whether your binary is compiled with **PIE (`-fPIE -pie`)**, **`-no-pie`**, or stripped with **`sstrip`**, you can paste addresses directly from `objdump`, `binpatch`, `readelf`, or `xxd`.
 
 ### Accepted Hex Formats
 Every address command (`stop`, `0x...`, `jump`, `--func`) normalizes whitespace, quotes, case, and `0x` prefixes automatically:
@@ -134,20 +143,20 @@ Every address command (`stop`, `0x...`, `jump`, `--func`) normalizes whitespace,
 - `"11 49"`
 
 ### Instant Run-To Shortcut (`0x...`)
-Type any `0x`-prefixed hex address by itself at the prompt (either in the main CLI or inside `view`):
+Type any `0x`-prefixed hex address alone at the prompt (in either the main CLI or `view`):
 ```text
-0x1040 (_start)> 0x12c4
+0x10a0 (_start)> 0x12c4
 [+] Ran to 0x12c4 (pie_vaddr(objdump=0x12c4))
 [*] Stopped (breakpoint-hit) at 0x12c4 in main
   => 0x12c4:  e8 23 ff ff ff           call   0x11ec <check_password>
 ```
-If the program has already exited, typing `0x12c4` restarts it cleanly and runs straight to `0x12c4`.
+If the program has already exited, typing `0x12c4` restarts it cleanly and runs straight there.
 
 ---
 
-## 6. Complete Interactive Command Reference
+## 7. Complete Interactive Command Reference
 
-Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` line editing) and `Tab` autocompletion are active in both the main REPL and `view`.
+Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` editing) and `Tab` autocompletion are active in both the main CLI and `view`.
 
 ### Navigation, Breakpoints & Execution
 | Command | Aliases | Usage & Behavior |
@@ -155,9 +164,9 @@ Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` line edi
 | **`0x<addr>`** | `"0x 11 49"` | Immediately runs (or restarts if exited) to `<addr>` and stops. |
 | **`call <func> [--ignore]`** | *(Tab completes)* | Runs to the next upcoming `call <func>` ahead of `PC` and steps straight inside. Pass `--ignore` to break globally if the call isn't linearly ahead. |
 | **`stop <addr\|sym>`** | `b`, `break` | Sets a persistent breakpoint at an `objdump`/hex address or symbol. |
-| **`main`** | `stop main` | Runs (or restarts if exited) directly to `main()`. |
-| **`start`** | `restart` | Restarts the program from the beginning and pauses at `_start`. |
-| **`run`** | `r` | Resumes execution, or restarts from the beginning if already exited. |
+| **`main`** | `stop main` | Runs (or restarts if exited) directly to `main()` (works on stripped/`sstrip` `x86_64`/`i386` binaries too). |
+| **`start`** | `restart` | Restarts the program cleanly from the beginning and pauses at `_start`. |
+| **`run`** | `r` | Resumes execution, or restarts automatically if already exited. |
 | **`continue`** | `c`, `cont` | Resumes execution until the next breakpoint or exit. |
 | **`jump <addr\|sym>`** | `jmp` | Forces `PC`/`RIP` immediately to `<addr>` or symbol (leaves stack and registers untouched). |
 
@@ -166,9 +175,9 @@ Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` line edi
 |---------|---------|------------------|
 | **`step [N]`** | `s`, `si` | Steps `1` (or `N`) instruction(s) into calls (skipping `.plt`/`libc` when `SKIP_EXTERNAL_FUNCTIONS = True`). |
 | **`next [N]`** | `n`, `ni` | Steps `1` (or `N`) instruction(s) over calls (batched natively via `ni N` for instant execution). |
-| **`step [N] dump`** | `next [N] dump` | Steps `N` times and writes every instruction, disassembly, and all register formats to `<bin>_steps_<date>.txt`. |
-| **`step [N] dump stack`** | `next [N] dump stack` | Same as above, plus dumps `stack_start.stack.bin` and `stack_end.stack.bin` inside `<bin>_stepdump_<date>/`. |
-| **`step [N] dump stack all`** | `next [N] dump stack all` | Prompts `"Are you sure? This will generate N stack dump files!"` and dumps a `.stack.bin` at every single step. |
+| **`step/next [N] dump`** | — | Steps `N` times and writes every instruction, disassembly, and all register formats to `<bin>_steps_<date>.txt`. |
+| **`step/next [N] dump stack`** | — | Same as above, plus dumps `stack_start.stack.bin` and `stack_end.stack.bin` inside `<bin>_stepdump_<date>/`. |
+| **`step/next [N] dump stack all`** | — | Prompts `"Are you sure? This will generate N stack dump files!"` and dumps a `.stack.bin` at every single step. |
 | **`skip`** | — | Finishes the rest of the current function and stops back in the caller. |
 
 ### Call Ignoring & Target Stdin
@@ -184,14 +193,14 @@ Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` line edi
 ### Disassembly, Registers & Memory
 | Command | Aliases | Usage & Behavior |
 |---------|---------|------------------|
-| **`view [opts]`** | `follow`, `live` | Launches stationary live-arrow TUI dashboard (see [Section 7](#7-live-view-view--nested-call-windows-nestn)). |
+| **`view [opts]`** | `follow`, `live` | Launches stationary live-arrow dashboard (see [Section 8](#8-live-view-view--nested-call-windows-nestn)). |
 | **`ls [N]`** | `ls`, `ls1`, `ls10`, `ls 20` | Shows `N` instructions before & after `PC` (default `2`), clamped to `.text` with top/bottom cutoff notices. Warns if `N > 100`. |
 | **`disas [N]`** | `disassemble`, `d` | Disassembles `N` instructions forward in `objdump` Intel style (`disas main [N]` supported). |
 | **`info [reg] [flag]`** | `show` | Dumps all registers (or one register) formatted as `REG: value`. Flags: `-h` (hex), `-d` (dec), `-c` (char), `-s` (string/C-string deref), `all` / `-a`. |
 | **`info stack`** | — | Prints all registers followed by the active stack preview. |
 | **`info raw stack`** | `info stack only` | Prints only the active stack preview (no registers). |
 | **`get <reg>`** | — | Case-insensitive single-register inspection in all formats (`hex \| dec \| char \| str`). |
-| **`set <reg> [to] <val>`** | — | Sets a register using hex (`0x2a`), decimal (`42`), or ASCII (`"ABCD"`). |
+| **`set <reg> [to] <val>`** | — | Modifies a register using hex (`0x2a`), decimal (`42`), or quoted ASCII (`"ABCD"`). |
 | **`stack`** | — | Previews the top and bottom of the active stack around `SP`. |
 | **`stack less`** | — | Pipes the active stack directly into `less` for interactive scrolling. |
 | **`stack info`** | — | Prints `[stack]` region bounds, total mapped size, active bytes (`SP` to top), and unused bytes. |
@@ -201,27 +210,26 @@ Full `readline` history (`Up` / `Down` arrows, `Ctrl+R`, `Left`/`Right` line edi
 
 ---
 
-## 7. Live View (`view`) & Nested Call Windows (`nestN`)
+## 8. Live View (`view`) & Nested Call Windows (`nestN`)
 
-Entering `view` switches into a **flicker-free, stationary dashboard** (updating in place via single-buffer ANSI writes—no scrolling spam and no blank-screen flashes).
+Entering `view` switches into a **flicker-free, stationary dashboard** rendered in a single buffered terminal flush—no scrolling spam and no blank-screen flashes.
 
 ### What You See by Default
 With the defaults in `src/config.py` (`VIEW_PAGE_SIZE = 41`, `VIEW_DEFAULT_REGS = True`, `VIEW_DEFAULT_STACK = True`, `VIEW_DEFAULT_REG_FORMAT = "all"`):
-- **Left Pane:** Up to 41 Intel instructions of your current function/page (`=>` walks down without the instructions moving) + **all core registers** in `hex | dec | char | str` format.
-- **Right Pane** *(on terminals `>= 125` cols wide)*: **Active `[STACK]`** starting at `SP`, automatically collapsing runs of 3+ unchanged zero lines (`... (N zero lines skipped) ...`) so you see both local variables/buffers AND saved frames/`argv`/`env` at once.
-- **Green Byte & Char Diffs:** Every register character and every individual stack byte (both hex pair and ASCII character) that changed on your last step is marked with `*` and highlighted **bright green**.
-- **Prompt Location:** Your live address & function (`0x126d (main)> `) sit right at the end of the `view` input line.
-- **Exit Output Persistence:** When the program terminates inside `view`, the `[EXITED]` screen prints the full accumulated `Program Output (stdout)` right inside the main panel.
+- **Left Pane:** Up to 41 Intel instructions of your current function/page (`=>` walks down without scrolling the code) + **all core registers** in `hex | dec | char | str` (automatically dereferencing pointers like `str=-> "letmein123"`).
+- **Right Pane** *(on terminals `>= 125` cols wide)*: **Active `[STACK]`** starting at `SP`, automatically collapsing runs of 3+ unchanged zero lines (`... (N zero lines skipped) ...`) so you see both local variables AND `argv`/`env` together.
+- **Exact Green Diffs:** Every changed register character and every individual changed stack byte (both hex pair and ASCII character) is marked with `*` and highlighted **bright green**.
+- **Live Prompt Location:** Your current address and function (`0x121f (main)> `) sit right at the end of the `view` prompt.
+- **Exit Output Box:** When the target terminates inside `view`, the `[EXITED]` view panel displays the full accumulated `Program Output (stdout)`.
 
 ### Launch Options & In-View Controls
 
-Launch `view` with any combination of flags in any order:
 ```text
-0x124f (main)> view                    # Default: 41 lines + info all + live stack
-0x124f (main)> view min                # Minimal: disassembly code only (alias: view only)
-0x124f (main)> view raw stack          # Code + live stack only (no registers)
-0x124f (main)> view nest2 30           # Root + up to 2 nested call panes, 30-line budget
-0x124f (main)> view max                # Full dashboard (Code + info all + Stack)
+0x121f (main)> view                    # Default: 41 lines + info all + live stack
+0x121f (main)> view min                # Minimal: disassembly code only (alias: view only)
+0x121f (main)> view raw stack          # Code + live stack only (no registers)
+0x121f (main)> view nest2 30           # Root + up to 2 nested call panes, 30-line budget
+0x121f (main)> view max                # Full dashboard (Code + info all + Stack)
 ```
 
 Everything is controllable **live inside `view`**:
@@ -231,138 +239,257 @@ Everything is controllable **live inside `view`**:
 - **`call <func> [--ignore]`**: Jump to upcoming call (with `Tab` autocomplete) and enter it.
 - **`info`** / **`regs`**: Toggle `[REGISTERS]` panel on/off.
 - **`stack`**: Toggle `[STACK]` panel on/off.
-- **`info all`**: Toggle register format between `all` (`hex | dec | char | str`) and compact `hex` (or type `-h`, `-d`, `-c`, `-s`).
+- **`info all`**: Toggle register format between `all` (`hex | dec | char | str`) and compact `hex` (or use `-h`, `-d`, `-c`, `-s`).
 - **`info <reg>`** / **`get <reg>`**: Inspect one register in all formats right in the status bar.
 - **`min`** / **`only`** / **`max`** / **`raw stack`** / **`all`**: Switch layouts instantaneously.
-- **`size <N>`** / **`<N>`**: Change code page size on the fly.
-- **`nest`** (`= nest1`), **`nest2`**, **`nest5`**, **`nest0`**: Change call-pane nesting depth on the fly. Parent caller windows stay pinned with `->` on their call site while the active callee shows `=>`, closing automatically when returning.
+- **`size <N>`** / **`<N>`**: Resize code page on the fly.
+- **`nest`** (`= nest1`), **`nest2`**, **`nest5`**, **`nest0`**: Open up to `N` nested caller/callee assembly panes simultaneously (`->` marks caller call sites; `=>` tracks live `PC`).
 - **`main`**, **`start`**, **`run`**, **`continue`**, **`jump <addr>`**, **`stop <addr>`**, **`set <reg> <val>`**, **`stdin <text>`**, **`dump stack`**, **`ignore ...`**, **`0x<addr>`**, **`q`**: All work directly inside `view`.
 
 ---
 
-## 8. Call Navigation (`call <func>`) & Call Ignoring (`ignore`)
+## 9. Call Navigation (`call <func>`) & Call Ignoring (`ignore`)
 
 ### Targeted `call <func>`
-When staring at a 40-line function like `main()` in a crackme, you often want to skip boilerplate `printf`/`strlen` setup and jump straight into `check_password`:
+Type `call ` and press **`Tab`** to autocomplete **only functions inside your binary** (`.symtab` + `.text`/`.plt` calls—never cluttered with 2,000 unrelated `libc` functions):
 ```text
-view [...] 0x124f (main)> call ch<Tab>
-view [...] 0x124f (main)> call check_password
+view [...] 0x121f (main)> call ch<Tab>
+view [...] 0x121f (main)> call check_password
 ```
-1. Pressing `Tab` completes **only functions that actually exist in your binary** (`.symtab` + `.text`/`.plt` calls)—never flooding you with 2,000 unrelated `libc` symbols.
-2. `bin-debug-friendly` scans ahead of `PC` for the first `call` matching `check_password`, runs right up to that `call` site, and steps 1 instruction inside `check_password` (`0x11ec`).
-3. If no call to `<target>` is visible ahead of `PC`, it warns you immediately instead of hanging in the background. Pass `--ignore` (`call secret_fn --ignore`) to break globally anywhere in the binary until `secret_fn` executes.
+- If the call appears ahead of `PC`, `call` runs right to that call site and steps 1 instruction straight into the callee.
+- If no call to `<target>` is visible ahead of `PC`, it warns you immediately instead of running away in the background. Pass `--ignore` (`call secret_fn --ignore`) to break globally anywhere in the binary until `secret_fn` executes.
 
 ### Call Ignoring (`ignore`)
-- **`ignore call`**: Steps over every `call` until you run `unignore call`.
-- **`ignore once` / `ignore call 3`**: Steps over the next `1` (or `3`) `call` instructions, then automatically resumes stepping into calls.
-- **`ignore nest`**: Lets you enter one function call, then skips any deeper helper calls inside it while letting you inspect every instruction of that function.
+- **`ignore call`** *(or `/ignore call`, `skip call`)*: Every `step` automatically steps *over* all `call` instructions until disabled.
+- **`ignore once`** / **`ignore call <N>`**: Ignores the next `1` (or `N`) `call` instructions encountered, then returns to normal stepping.
+- **`ignore nest`**: Allows entering 1 call deeper, then skips deeper nested helper calls inside it.
+- **`unignore call`** *(or `unignore`, `unskip call`)*: Resumes stepping into calls normally.
 
 ---
 
-## 9. Interactive `stdin` (`fgets` / `scanf` / `read`)
+## 10. Interactive `stdin` (`fgets` / `scanf` / `read`)
 
-When debugging crackmes or CLI tools that read user input (`fgets`, `scanf`, `gets`, `getchar`, `getline`, `read`):
-- The target binary's `fd 0` is wired to a dedicated sandboxed FIFO (`/tmp/work/target_stdin`), completely separate from GDB's MI2 pipe.
-- Whenever you step over or run into an input call (or whenever a running target waits for input in interactive mode or `--map`), `bin-debug-friendly`:
-  1. Flushes any accidental held-down `Enter` keystrokes from your terminal (`termios.tcflush`) so spamming `Enter` while stepping never skips the prompt.
+The target binary's `fd 0` is wired to a dedicated sandboxed FIFO (`/tmp/work/target_stdin`), completely isolated from GDB's MI2 control pipe:
+- Whenever the target reads input (`fgets`, `scanf`, `gets`, `getchar`, `getline`, `read`) in interactive CLI, `view`, `--map`, or `heap_dump.py`:
+  1. Flushes any accidental held-down `Enter` keys from your TTY (`termios.tcflush`) so spamming `Enter` never skips your input prompt.
   2. Prompts cleanly:
-     ```text
-     [INPUT] Target is calling fgets/scanf/read.
-     Type stdin line + Enter (empty Enter sends '\n', Ctrl+C cancels): crackme123
-     ```
-  3. Feeds `"crackme123\n"` into the target and pauses cleanly right after `fgets` returns—where you immediately see `"crackme123"` light up **green** in `[STACK]`!
-- You can also pre-queue input lines anytime before stepping using `stdin <text>`.
+     - **Proactive prompt** *(caught before stepping over `fgets`/`scanf`/`read`)*:
+       ```text
+       [INPUT] Target is calling fgets/scanf/read.
+       Type stdin line + Enter (empty Enter sends '\n', Ctrl+C cancels):
+       ```
+       Pressing **`Ctrl+C` cancels** that step without feeding stdin and keeps the target paused before the call.
+     - **Running-target prompt** *(when `run`/`continue`/`--map` blocks on `stdin`)*:
+       ```text
+       [INPUT] Target is waiting on stdin.
+       Type stdin line + Enter (empty Enter sends '\n', Ctrl+C pauses):
+       ```
+       Pressing **`Ctrl+C` pauses** the running inferior via `-exec-interrupt` and returns control to you.
+  3. Otherwise feeds `<your_text>\n` into the target FIFO and lets execution continue past the read.
+- You can also pre-queue input anytime before stepping with `stdin <text>`.
 
 ---
 
-## 10. Smart Zero-Trimmed Stack Inspection & Dumping
+## 11. Smart Zero-Trimmed Stack Inspection & Dumping
 
-Linux maps `135 KB` (`0x21000` bytes) for `[stack]`, almost all of which below `SP` is unused `0x00` guard memory.
-
-- **`dump stack`** dumps **only the active stack (`SP` up to stack top)** and strips leading/trailing pure-zero 16-byte rows (`TRIM_STACK_DUMP_ZEROS = True`), saving `<binary>.stack.bin` (typically ~900 bytes–2 KB instead of 135 KB):
-  ```text
-  0x124f (main)> dump stack
-  [+] Dumped 928 bytes (0x7fffffffec60-0x7ffffffff000, active SP trimmed) -> ./main.stack.bin
-      Inspect with: xxd main.stack.bin | less
-  ```
-- **`dump stack full`** dumps the entire raw `[stack]` VMA if needed.
+Linux maps `135 KB` (`0x21000` bytes) for `[stack]`, most of which below `SP` is empty `0x00` guard memory.
+- **`dump stack`** dumps **only the active stack (`SP` up to stack top)** and strips leading/trailing pure-zero 16-byte rows (`TRIM_STACK_DUMP_ZEROS = True`) into `<binary>.stack.bin` ready for `xxd`.
+- **`dump stack full`** dumps the entire raw `[stack]` VMA.
 - **`stack less`** opens the active stack directly inside `less`.
-- **`stack info`** prints exact `[stack]` start/end addresses, total mapped size, active bytes, and unused bytes.
+- **`stack info`** prints exact mapping bounds, active stack bytes, and unused space.
 
 ---
 
-## 11. Session Recording (`--record`)
+## 12. Session Recording (`--record`) & Register Dereferencing (`DEREF`)
 
 Launch with `-record` or `--record`:
 ```bash
-python3 main.py ./crackme -m --record
+python3 main.py ./test4 --record
 ```
 
-Every action is recorded into a timestamped folder:
+Creates `record-<binary>_<DD-MM-YYYY_HH-MM-SS>/`:
 ```text
-record-crackme_23-11-2026_14-04-27/
-├── full_recording.txt          # Chronological session events
-└── functions/                  # Created when function events occur
+record-test4_24-11-2026_12-08-18/
+├── full_recording.txt          # Chronological events, disas context, stack, & DEREF strings
+└── functions/                  # Per-function filtered logs (created when function events exist)
     ├── func_main.txt
-    ├── func_check_password.txt
-    └── func_build_password.txt
+    └── func_exited.txt
 ```
 
-### What Gets Recorded
-- **Per-Event Header:** Event number, European 24h timestamp (`DD-MM-YYYY HH:MM:SS.uuuuuu`), exact command typed, execution duration (`ms`), current `objdump`-style address, and function name.
-- **Disassembly Context:** `+/- RECORD_DISAS_CONTEXT` instructions (`4` behind, `=>` current, `4` ahead).
-- **Exact Diffs:** `CHANGED` register summary, `STDOUT` output, and `STACK CHANGED` rows on every step—plus **full register state & full active stack** at event #1, whenever entering a new function, and on program exit.
-- **Zero Stepping Overhead:** Buffers strictly in memory during active commands and flushes to disk only while idle waiting for your next command (with `atexit`/`finally` hooks guaranteeing `Ctrl+C` never loses data).
+### Register Dereferencing (`DEREF`)
+Even when a binary stores secrets **exclusively on the heap** (`malloc(64)`), whenever any GPR (`RAX`, `RDI`, `RSI`, `RDX`, etc.) points to a printable C-string (`>= 0x1000`), `--record` logs it automatically:
+```text
+[EVENT #00190] TIME=24-11-2026 12:09:12.114201 | CMD='step' | DURATION=0.49ms
+  LOCATION : 0x11fe (??)
+  CHANGED  : RDI=0x5555555590a0 RIP=0x5555555551fe
+  DEREF    : RDI->'letmein123' | R15->'@QUUUU'
+```
+*(Coincidental short ASCII runs inside GOT/libc pointers like `@QUUUU` can appear alongside real strings like `letmein123`.)*
+
+Events buffer in memory and flush to disk **only while idle at the prompt** (plus `atexit`/`finally` hooks so `Ctrl+C` never loses data).
 
 ---
 
-## 12. Autonomous Execution Mapping (`--map` & `--func`)
+## 13. Autonomous Execution Mapping (`--map` & `--func`)
 
 Run non-interactive execution tracing across the whole binary or a single function:
 ```bash
-# Map entire main-binary execution + stack + syscalls (starts from _start)
+# Map entire main-binary execution + stack + derefs + syscalls (from _start)
 python3 main.py ./my_program --map
 
 # Map from main() forward
 python3 main.py ./my_program --map -m
 
 # Map only a specific function (auto-detects return via call depth)
-python3 main.py ./my_program -map -func 0x1189
+python3 main.py ./my_program -map -func 0x1199
 
-# Also capture .stack.bin snapshots on every syscall
+# Also capture binary .stack.bin snapshots on every syscall
 python3 main.py ./my_program --map --dump-stack-syscalls
 ```
 
-Creates `<program>-mapped_<DD-MM-YYYY_HH-MM-SS>/` (non-JSON, human-readable & grep-friendly, hard-capped at `MAX_MAP_FOLDER_MB = 250` MB):
+Creates `<program>-mapped_<DD-MM-YYYY_HH-MM-SS>/`:
 ```text
-my_program-mapped_23-11-2026_12-29-58/
-├── full_trace.txt        # Chronological instruction trace, EU timestamps, func addr, all GPRs,
-│                         # FULL ACTIVE STACK on function entry & STACK CHANGED rows on modifying steps
-├── syscalls_trace.txt    # Every syscall: name, number, caller PC, time in/out, regs in, ret out
-├── summary.txt           # Instruction totals, jumps/calls/rets/mem accesses, VmHWM peak memory, func & syscall tables
+my_program-mapped_24-11-2026_12-10-41/
+├── full_trace.txt                  # Chronological instruction trace, EU 24h timestamps, func addr, all GPRs,
+│                                   # DEREF register strings, FULL ACTIVE STACK on entry, & STACK CHANGED rows
+├── syscalls_trace.txt              # Every syscall: name, number, caller PC, time in/out, regs in, ret out
+├── summary.txt                     # Instruction totals, jumps/calls/rets/mem accesses, VmHWM peak memory, func & syscall tables
+├── syscall_0001_write.stack.bin    # (Only created when --dump-stack-syscalls is passed)
 └── functions/
-    ├── func_0x1040.txt
-    ├── func_0x1139.txt
-    └── func_0x1189.txt
+    └── func_0x...txt
 ```
-- **Active Stack Tracking:** Unlike raw GDB instruction tracers, `full_trace.txt` logs `FULL ACTIVE STACK` on each function entry and `STACK CHANGED` rows on steps where the stack is modified.
-- **Interactive `stdin` Support:** If the binary calls `fgets`/`scanf`/`read` during `--map`, it cleanly asks for input via `[INPUT]` without hanging in the background.
-- **Clean Interrupts:** Pressing `Ctrl+C` cleanly finalizes the partial trace and records `Interrupted By User : YES` in `summary.txt`.
-- **Skips `libc` / `ld.so` Clutter:** Automatically skips external shared-library instructions while still trapping callbacks back into your binary (such as `main()` from `__libc_start_main`) and logging every syscall invoked inside external calls (`write`, `newfstatat`, `brk`, `exit_group`, etc.).
 
 ---
 
-## 13. Configuration (`src/config.py`)
+## 14. Lifecycle Heap Dumper (`heap_dump.py`)
 
-Customize defaults cleanly in `src/config.py`:
+**Stop guessing what's on the heap. See it.**
+
+A companion script to `bin-debug-friendly` that captures `[heap]` across the binary's lifecycle—working on normal, stripped, and `sstrip`ped binaries inside Bubblewrap (up to `MAX_HEAP_SNAPSHOTS = 16` distinct snapshots per run).
+
+### Three Modes
+| Mode | Command | Behavior |
+|---|---|---|
+| **Interactive** | `python3 heap_dump.py test4` | Prompts you for stdin at `sys_read`. |
+| **Scripted** | `python3 heap_dump.py test4 --input "letmein123"` | Feeds `"letmein123\n"` non-interactively. |
+| **Empty** | `python3 heap_dump.py test4 --no-input` | Sends an empty `\n`. |
+
+### How It Works
+1. **Pre-Stdin Trap:** Traps kernel `sys_read` (`fd == 0`) right before stdin is read and takes a **`pre-stdin`** `[heap]` snapshot (catching secrets planted before `fgets`, and proceeding cleanly if `malloc` isn't called until after `fgets`).
+2. **Post-Stdin Anti-Wipe Traps:** Feeds your input, then installs watchpoints on `libc` `.dynsym` functions (`strcmp`, `strncmp`, `memcmp`, `explicit_bzero`, `__explicit_bzero_chk`, `free`) plus `catch syscall exit_group`/`exit` (so even on `sstrip`ped targets, `[heap]` is snapshotted *before* `explicit_bzero` or `free` erases secrets written after `fgets`).
+3. **Artifacts Saved to `<binary>_heapdump/`:**
+   ```text
+   test4_heapdump/
+   ├── heap.bin            # Raw concatenated heap snapshots across the lifecycle (up to 16 states)
+   ├── heap.strings.txt    # Every unique string with [phase] tags ("0xADDR  [phase]  string")
+   └── stdout.txt          # Target's stdout output
+   ```
+
+### Options
+| Flag | Default | Controls |
+|------|---------|----------|
+| `-i`, `--input` | *(none)* | Pre-feed a line of stdin (non-interactive). |
+| `--no-input` | `False` | Send an empty newline `\n`. |
+| `--min-len N` | `4` | Minimum string length to include. |
+| `--top N` | `25` | Number of strings to print to terminal (all strings are saved to file). |
+| `-o`, `--output` | `./<bin>_heapdump` | Custom output directory. |
+
+### Real Observed Run on `sstrip`ped `test4`
+In `test4`, `build_password(pw)` decodes `letmein123` before `fgets`, so `letmein123` is caught at `[pre-stdin]`, while post-input heap writes (`fghj`, `Password: Wrong.`) are caught at `[strcmp]` and `[pre-free]` (whereas a binary that decodes `pw` *after* `fgets` and calls `explicit_bzero`/`free` sees `pw` at `[strcmp]` / `[pre-bzero]` / `[pre-free]`):
+```text
+$ python3 heap_dump.py test4
+[*] test4 (x86_64, PIE, sstrip=yes)
+[*] Bubblewrap Sandbox active: /home hidden, --unshare-all, --cap-drop ALL, no internet
+[*] Running to first stdin read...
+[+] Pre-stdin [heap] snapshot: 135,168 bytes
+
+[INPUT] Target is waiting on stdin.
+Type stdin line + Enter (empty Enter sends '\n', Ctrl+C pauses): fghj
+[+] Captured 6 distinct heap state(s) (811,008 bytes total)
+[+] Unique heap/pointer strings: 10
+  0x00005555555590f0  [pre-free    ]  'Password: Wrong.'
+  0x00005555555590a0  [pre-stdin   ]  'letmein123'
+  0x00005555555590f0  [pre-stdin   ]  'Password: '
+  0x0000555555557dd8  [strcmp/reg  ]  '@QUUUU'
+  0x00007fffffffec38  [pre-free/reg]  'ASUUUU'
+  0x00007fffffffec38  [pre-free/reg]  'MSUUUU'
+  0x0000555555559010  [strcmp      ]  'fghj'
+  0x0000555555559010  [pre-free    ]  'YUUU'
+  0x000055555555901c  [pre-free    ]  'tw4<'
+  0x000055555555b1e2  [pre-free    ]  'UUUU'
+[*] Target output: 'Password: Wrong.'
+[+] Saved artifacts -> /home/themaster1127/GitHub_Projects/bin-debug-friendly/test4_heapdump/
+```
+
+---
+
+## 15. Dynamic Stack & Register String Extractor (`stack_strings.py`)
+
+Static `strings binary` only sees `.rodata`. `stack_strings.py` parses any `record-.../` folder, `...-mapped_.../` folder, or `.txt` trace, **concatenates every stack snapshot and every `DEREF:` register string across time into a raw binary file**, and extracts every unique string chronologically.
+
+```bash
+# Extract with discovery timeline and collapse partial build-up prefixes
+python3 stack_strings.py ./record-test4_24-11-2026_12-08-18 -a -c
+```
+
+### Options
+| Flag | Description |
+|------|-------------|
+| `-n`, `--min-len` | Minimum string length (default: `4`). Use `-n 1` to see 1-char build-ups. |
+| `-c`, `--collapse` | Collapse incremental prefixes (e.g. keep `crackme123` and drop `crac`, `crack`, `crackme`). |
+| `-a`, `--annotated` | Print `[EVENT/STEP @ location]` discovery timeline for every string. |
+| `-s`, `--sort` | Sort alphabetically instead of chronological discovery order. |
+| `-q`, `--quiet` | Print only unique strings to stdout (great for piping to `grep`). |
+| `-b`, `--bin-out` | Custom path for concatenated binary output (`<target>_all_stacks.bin`). |
+| `-o`, `--out` | Custom path for extracted strings file (`<target>_stack_strings.txt`). |
+
+### Real Output on `sstrip`ped `test4`
+```text
+=== UNIQUE STRINGS FOUND (STACK & DEREF REGISTERS) ===
+  [EVENT #00001                                ] /tmp/work/target_bin
+  [EVENT #00001                                ] PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  [EVENT #00045 @  (RDX deref)                 ] 6?.7?34khi
+  [EVENT #00190 @  (RDI deref)                 ] letmein123
+  [EVENT #00202 @  (RAX deref)                 ] Password:
+  [EVENT #00220 @  (RAX deref)                 ] ghjyk
+  [EVENT #00264 @  (RAX deref)                 ] Wrong.
+```
+Notice it captured **both** the raw encrypted XOR bytes (`6?.7?34khi`) *and* the final decrypted password (`letmein123`)—straight from an `sstrip`ped binary!
+
+---
+
+## 16. Safety Limits, Timeouts & Graceful Interrupts
+
+To prevent runaway loops, frozen sockets, or disk exhaustion:
+
+1. **Interactive Batch Step Cap (`MAX_INTERACTIVE_STEPS = 100_000`):**  
+   Bounds single `step <N>` / `next <N>` commands to `1..100,000` instructions.
+2. **Mapper Instruction Cap (`MAX_MAP_INSTRUCTIONS = 2_000_000`):**  
+   If a target enters an infinite or runaway loop during `--map`, tracing halts cleanly after **2,000,000 instructions** and writes `summary.txt`.
+3. **Mapper Disk Size Cap (`MAX_MAP_FOLDER_MB = 250`):**  
+   If `--map` output reaches **250 MB**, writing halts cleanly and `summary.txt` records `Truncated By Size Cap : YES`.
+4. **Heap Snapshot Cap (`MAX_HEAP_SNAPSHOTS = 16`):**  
+   `heap_dump.py` captures up to **16** distinct `[heap]` states per run (and up to `200` trap stops) before releasing the target to exit.
+5. **Non-Interactive Wait Timeout (`30.0` seconds):**  
+   When no `stdin` prompt handler is attached (e.g., `heap_dump.py --input` if a target loops onto a second blocking `fgets`, or automated waits), `wait_stopped(timeout=30.0)` returns `None` after **30 seconds**; `heap_dump.py` then detaches traps or lets `finally: session.close()` tear down the sandbox cleanly and return to your shell. (Single MI commands also enforce `GDB_CMD_TIMEOUT_S = 15.0`.)
+6. **Graceful `Ctrl+C` Behavior:**
+   - **`--map`:** Halts tracing, flushes any open syscall/stack record, and writes `summary.txt` with `Interrupted By User : YES`.
+   - **`--record`:** Flushes all buffered events and closes `full_recording.txt` with `=== RECORDING CLOSED AT ... ===`.
+   - **Interactive CLI / `view`:** Pauses the running inferior via `-exec-interrupt` (or cancels a proactive stdin prompt).
+   - **`heap_dump.py`:** Aborts cleanly and tears down the Bubblewrap sandbox via `finally: session.close()`.
+
+---
+
+## 17. Configuration Reference (`src/config.py`)
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `DEFAULT_INFO_FORMAT` | `"hex"` | Default format for CLI `info`/`show` (`"hex"`, `"dec"`, `"char"`, `"str"`, `"all"`). |
-| `ENABLE_COLORS` | `True` | Enable green diff highlights via `colorama` when stdout is a TTY. |
-| `PROMPT_SHOW_ADDRESS` | `True` | Show `objdump`-style PC in prompts (`0x126d`). |
+| `ENABLE_COLORS` | `True` | Enable TTY-only green diff highlights via optional `colorama`. |
+| `PROMPT_SHOW_ADDRESS` | `True` | Show `objdump`-style PC in prompts (`0x121f`). |
 | `PROMPT_SHOW_FUNCTION` | `True` | Show enclosing function name in prompts (`(main)`). |
 | `PROMPT_SHOW_TOOL_NAME` | `False` | Prefix prompt with `PROMPT_TOOL_NAME` (`"bdf"`). |
+| `PROMPT_TOOL_NAME` | `"bdf"` | Fallback/prefix tool label in prompts. |
 | `USE_OBJDUMP_ADDR` | `True` | Rebase PIE addresses inside the binary to `objdump` offsets. |
 | `SHOW_OPCODES_IN_DISAS` | `True` | Show raw instruction hex opcodes alongside Intel mnemonics. |
 | `VIEW_PAGE_SIZE` | `41` | Default instruction page size in `view`. |
@@ -372,30 +499,39 @@ Customize defaults cleanly in `src/config.py`:
 | `VIEW_DEFAULT_NEST` | `0` | Default nested call pane depth (`0` = active frame only). |
 | `VIEW_HIGHLIGHT_CHANGES` | `True` | Mark changed registers & stack bytes with `*` and green diffs. |
 | `VIEW_SPLIT_MIN_COLS` | `125` | Terminal column threshold for side-by-side split layout. |
-| `COLLAPSE_STACK_ZEROS_IN_VIEW` | `True` | Collapse runs of 3+ unchanged all-zero stack rows in `view`. |
+| `VIEW_STACK_ROWS` | `14` | Fallback stack rows on narrow terminals. |
+| `COLLAPSE_STACK_ZEROS_IN_VIEW` | `True` | Collapse runs of 3+ unchanged all-zero stack lines in `view`. |
 | `RECORD_DISAS_CONTEXT` | `4` | Instructions captured before & after `PC` per `--record` event. |
 | `SKIP_EXTERNAL_FUNCTIONS` | `True` | Auto-skip `.plt` stubs, `ld.so`, and `libc` internals on `step`. |
 | `TRIM_STACK_DUMP_ZEROS` | `True` | Trim leading/trailing zero rows in `dump stack`. |
 | `MAX_MAP_FOLDER_MB` | `250` | Maximum output size (MB) for `--map` folders. |
 | `MAX_MAP_INSTRUCTIONS` | `2_000_000` | Safety instruction cap for `--map` against infinite loops. |
+| `MAX_INTERACTIVE_STEPS` | `100_000` | Maximum step/next count per single interactive command. |
+| `STACK_PREVIEW_LINES` | `16` | Stack preview line count for `stack` / `info stack`. |
+| `FALLBACK_STACK_DOWN_BYTES` | `4096` | Fallback stack read window below `SP` if `/proc` mapping is unavailable. |
+| `FALLBACK_STACK_UP_BYTES` | `65536` | Fallback stack read window above `SP` if `/proc` mapping is unavailable. |
+| `GDB_CMD_TIMEOUT_S` | `15.0` | Timeout (seconds) for individual GDB/MI commands. |
+| `SANDBOX_SELFTEST_TIMEOUT_S` | `5.0` | Timeout (seconds) for Bubblewrap startup self-test. |
+| `EU_FOLDER_TS_FORMAT` | `"%d-%m-%Y_%H-%M-%S"` | European 24-hour folder timestamp format. |
+| `EU_LOG_TS_FORMAT` | `"%d-%m-%Y %H:%M:%S"` | European 24-hour log timestamp format. |
 
 ---
 
-## 14. Security Model (Bubblewrap Sandbox & `--no-sandbox`)
+## 18. Security Model (Bubblewrap Sandbox & `--no-sandbox`)
 
-Every debugged binary and GDB session runs inside an isolated Bubblewrap container by default:
+Every debugged binary, GDB instance, and `heap_dump.py` run executes inside an air-gapped Bubblewrap container by default:
 ```bash
 bwrap --unshare-all --cap-drop ALL --new-session --die-with-parent --clearenv ...
 ```
-- **`/home` is completely hidden and unmounted.**
+- **`/home` is completely unmounted and invisible.**
 - **Zero network / internet access** (`--unshare-all`).
 - **System paths (`/usr`, `/bin`, `/lib*`) are read-only.**
-- **Only a disposable `/tmp/work` sandbox directory is writable.**
-- **Explicit `--no-sandbox` Gate:** Disabling the sandbox displays a full-screen security warning and requires two confirmations plus typing `"I know"` explicitly before touching the host.
+- **Only a disposable `/tmp/work` directory is writable.**
+- **Explicit `--no-sandbox` Gate:** Disabling the sandbox displays a full-screen warning and requires a 3-step confirmation (two yes/no prompts followed by typing `"I know"`) before touching the host.
 
 ---
 
-## 15. Cross-Architecture Debugging (QEMU + ARM / AArch64 / x86)
+## 19. Cross-Architecture Debugging (QEMU + ARM / AArch64 / x86)
 
 `bin-debug-friendly` inspects `e_machine` in the ELF header automatically:
 - **Native (`x86_64` on `x86_64`, `i386` on `x86_64`, `aarch64` on `aarch64`):** Debugs natively inside Bubblewrap.
@@ -403,32 +539,40 @@ bwrap --unshare-all --cap-drop ALL --new-session --die-with-parent --clearenv ..
 
 ---
 
-## 16. Real-World Reverse Engineering Walkthroughs
+## 20. Real-World Reverse Engineering Walkthroughs
 
-### Walkthrough 1: Cracking a Password-Checking Binary (`fgets` + XOR Loop)
+### Walkthrough 1: Shredding a Completely `sstrip`ped Heap Crackme (`test4`)
+```bash
+# 1. Dump the heap right before stdin AND before free/bzero wipes
+python3 heap_dump.py ./test4 --input test
+
+# 2. Or record interactively with DEREF register tracking, then extract all secrets
+python3 main.py ./test4 --record
+python3 stack_strings.py ./record-test4_... -a -c
+```
+Both routes uncover `letmein123` immediately—even with zero symbols and zero section headers!
+
+### Walkthrough 2: Cracking a Stack XOR Loop in Live `view`
 ```bash
 python3 main.py ./crackme -m --record
 ```
-1. You land paused directly at `main()`. Type `view` to open the 41-line split dashboard with `all` registers and live `[STACK]`.
-2. Notice `call check_password` ahead at `0x12c4`, preceded by `call fgets@plt` at `0x1288`.
-3. Type `call check<Tab>` -> `call check_password`.
-4. Before `fgets@plt` executes, `bin-debug-friendly` flushes buffered keys and asks `[INPUT] Target is calling fgets/scanf/read`. Type `test123` + Enter.
-5. Execution stops right at `0x11ec (check_password)` and `"test123"` appears in `[STACK]`.
-6. Type `call build_password`, then `step 19` a few times—watching the XOR loop decode `"crackme123"` byte-by-byte in bright green on the stack right before `call strcmp@plt`!
-7. Quit with `q` -> `q`; your complete session is saved under `record-crackme_.../full_recording.txt` and `functions/func_build_password.txt`.
+1. Type `view` to open the 41-line split dashboard (`all` registers + live `[STACK]`).
+2. Type `call check<Tab>` $\rightarrow$ `call check_password`, and feed `fgets` when prompted so execution enters `check_password`.
+3. Because execution is now paused inside `check_password`, typing `call build_password` scans forward from `check_password`'s body and steps straight into the XOR loop.
+4. Hold `Enter` or type `step 19` to watch the XOR loop decode `"crackme123"` byte-by-byte in bright green on the stack.
+5. Run `python3 stack_strings.py ./record-crackme_... -c -a` to extract the full timeline.
 
-### Walkthrough 2: Pairing with `binpatch` + `xxd`
-1. Find an interesting offset or branch with `binpatch` (`binpatch ./app -m -d -r`).
-2. Jump straight there without manual PIE math:
-   ```bash
-   python3 main.py ./app
-   0x1040 (_start)> 0x11cd
-   ```
-3. Inspect registers in ASCII/string mode (`info -s` or `get rdi`), test forcing a branch via `set rax 1` or `jump 0x11e2`, or dump the active stack (`dump stack`) and inspect with `xxd app.stack.bin`.
+### Walkthrough 3: Debugging Sub-1 KB Custom-Syscall ELF Binaries
+```bash
+python3 main.py ./tiny_syscall_bin
+0x4001dd> ignore call
+0x4001dd> view
+```
+Even on minimal hand-assembled or debloated custom-syscall ELF binaries with no `libc` and 1 single `PT_LOAD` segment, `bin-debug-friendly` steps cleanly through loops, tracks registers/stack, and shows all `stdout` output on exit.
 
 ---
 
-## 17. Running the Test Suite
+## 21. Running the Test Suite
 
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py" -v

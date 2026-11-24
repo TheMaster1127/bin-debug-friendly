@@ -190,6 +190,7 @@ def _record_cli_event(
             stack_lines=[],
             stdout_text=stdout_text,
             note=f"exit_code={session.exit_code}" if not note else note,
+            derefs=None,
         )
         return
     pc = session.get_pc()
@@ -205,6 +206,7 @@ def _record_cli_event(
         for idx, (a, op, insn) in enumerate(ctx_insns)
     ]
     regs = session.get_registers()
+    derefs = session.get_registers_deref()
     lo, hi, sp, _ = session.get_stack_bounds()
     active_len = min(max(64, hi - sp), 64 * 1024)
     sdata = session.read_memory(sp, active_len) or b""
@@ -220,6 +222,7 @@ def _record_cli_event(
         stack_lines=slines,
         stdout_text=stdout_text,
         note=note,
+        derefs=derefs,
     )
 
 
@@ -235,7 +238,7 @@ def run_interactive_cli(session: GdbSession, recorder: SessionRecorder | None = 
     if recorder is not None:
         print(f"[*] Session recording active -> {recorder.out_dir}/")
     print_stop_banner(session, {"reason": "ready"})
-    print("Type 'help' for commands (try 'view', 'call <func>' with Tab completion, or '0x...').")
+    print("Type 'help' for commands (try 'view' or 'view max', or '0x...' to run there).")
 
     while True:
         if recorder is not None:

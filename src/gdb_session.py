@@ -9,7 +9,12 @@ import tempfile
 from pathlib import Path
 
 from src.config import SKIP_EXTERNAL_FUNCTIONS
-from src.elf_utils import ElfInfo, resolve_target_address
+from src.elf_utils import (
+    ElfInfo,
+    reconstruct_sstripped_sections,
+    resolve_entry_main_address,
+    resolve_target_address,
+)
 from src.gdb_inspector import GdbInspectorMixin
 from src.mi_protocol import MIProtocol
 from src.sandbox import (
@@ -143,6 +148,10 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         shutil.copy2(self.host_binary_path, self.local_bin_host)
         os.chmod(self.local_bin_host, 0o755)
 
+        # Sanitize sstripped binaries in the sandbox copy so GDB's BFD never crashes
+        if self.elf.is_sstripped:
+            reconstruct_sstripped_sections(self.local_bin_host, self.elf)
+
         self.target_path_in_gdb = "/tmp/work/target_bin" if self.sandbox.enabled else str(self.local_bin_host)
         self.stdin_path_in_gdb: str = ""
         self.reg_names: list[str] = []
@@ -259,16 +268,37 @@ class GdbSession(MIProtocol, GdbInspectorMixin):
         return res["status"] != "error" and "No symbol" not in res["console"]
 
     def stop_at_symbol(self, symbol: str) -> tuple[bool, str, dict | None]:
-        if not self.has_symbol(symbol):
-            return False, f"No '{symbol}' function found in this binary.", None
         if self.exited or not self.started:
             self.started = False
             self.ensure_started_paused()
-        res = self.send(f"-break-insert -t {symbol}")
-        if res["status"] == "error":
-            return False, res["payload"].get("msg", f"Failed to break at {symbol}"), None
-        stopped = self.run_or_continue()
-        return True, f"Stopped at {symbol}", stopped
+
+        if self.has_symbol(symbol):
+            res = self.send(f"-break-insert -t {symbol}")
+            if res["status"] != "error":
+                stopped = self.run_or_continue()
+                return True, f"Stopped at {symbol}", stopped
+
+        if symbol.lower() == "main":
+            main_vaddr = resolve_entry_main_address(self.elf)
+            if main_vaddr is not None:
+                base = self.runtime_base if self.runtime_base is not None else self.elf.base_vaddr
+                runtime_main, _mode = resolve_target_address(main_vaddr, self.elf, base)
+                res = self.send(f"-break-insert -t *0x{runtime_main:x}")
+                if res["status"] != "error":
+                    stopped = self.run_or_continue()
+                    disp = self.to_display_addr(runtime_main)
+                    return True, f"Stopped at main (0x{disp:x})", stopped
+
+        return False, f"No '{symbol}' function found in this binary.", None
+
+    def get_registers_deref(self) -> dict[str, str]:
+        regs = self.get_registers()
+        derefs = {}
+        for rname, val in regs.items():
+            s = self.read_c_string(val)
+            if s and len(s.strip()) >= 2:
+                derefs[rname] = s.strip()
+        return derefs
 
     def run_to_next_call(self, raw_args: str) -> tuple[bool, str, dict | None]:
         tokens = raw_args.strip().split()

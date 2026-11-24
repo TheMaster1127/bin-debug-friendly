@@ -409,6 +409,7 @@ def _record_view_step(
             stack_lines=[],
             stdout_text=stdout_text,
             note=f"exit_code={session.exit_code}" if not note else note,
+            derefs=None,
         )
         return
     pc = session.get_pc()
@@ -424,6 +425,7 @@ def _record_view_step(
         for idx, (a, op, insn) in enumerate(ctx_insns)
     ]
     regs = session.get_registers()
+    derefs = session.get_registers_deref()
     slines = _read_full_active_stack_lines(session)
     recorder.record_event(
         command=cmd_str,
@@ -436,6 +438,7 @@ def _record_view_step(
         stack_lines=slines,
         stdout_text=stdout_text,
         note=note,
+        derefs=derefs,
     )
 
 

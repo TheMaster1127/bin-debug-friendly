@@ -313,6 +313,7 @@ def run_execution_mapper(
                 insns = session.disassemble_at(pc, count=1)
                 insn_text = insns[0][2] if insns else "<unknown>"
                 regs = session.get_registers()
+                derefs = session.get_registers_deref()
                 stack_lines = _read_active_stack_lines(session)
                 stack_block = _format_stack_section(stack_lines, last_stack_lines, is_func_entry)
                 if stack_lines:
@@ -333,11 +334,17 @@ def run_execution_mapper(
                 disp_pc = session.to_display_addr(pc)
                 disp_func = session.to_display_addr(cur_func)
                 regs_str = " ".join(f"{k.upper()}=0x{v:x}" for k, v in regs.items())
+                deref_line = (
+                    f"  DEREF: {' | '.join(f'{k.upper()}->{repr(s)}' for k, s in derefs.items())}\n"
+                    if derefs
+                    else ""
+                )
 
                 block = (
                     f"[STEP {total_insns:06d}] TIME={eu_timestamp_now()} | "
                     f"FUNC=0x{disp_func:x} | ADDR=0x{disp_pc:x} | INSN={insn_text}\n"
                     f"  REGS: {regs_str}\n"
+                    f"{deref_line}"
                     f"{stack_block}"
                 )
                 block_bytes = len(block.encode("utf-8"))

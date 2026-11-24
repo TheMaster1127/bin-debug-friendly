@@ -1,16 +1,59 @@
+# ──────────────────────────────────────────────────────────────
+#  Python artifacts - But some of them may not be used actually.
+# ──────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
+.pyd
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-*-mapped_*/
-record-*/
-record-*.txt
-*_steps_*.txt
-*_stepdump_*/
-*.stack.bin
-
+# ──────────────────────────────────────────────────────────────
+#  Compiled C artifacts
+# ──────────────────────────────────────────────────────────────
 *.o
 *.out
-main
-test2
+*.so
+*.a
+*.dylib
+
+# ──────────────────────────────────────────────────────────────
+#  Test binaries (extensionless executables at repo root)
+#  Add new ones here as you build them.
+# ──────────────────────────────────────────────────────────────
+/main
+/test2
+/test3
+/test4
+/test4_reba
+/hello_cib
+
+# ──────────────────────────────────────────────────────────────
+#  Mapper / recorder / dumper output folders
+# ──────────────────────────────────────────────────────────────
+*-mapped_*/
+record-*/
+*_heapdump/
+*_stepdump_*/
+
+# ──────────────────────────────────────────────────────────────
+#  Generated trace / dump files (catches stragglers when you
+#  run stack_strings.py manually against a record folder)
+# ──────────────────────────────────────────────────────────────
+*.stack.bin
+*_all_stacks.bin
+*_stack_strings.txt
+*_steps_*.txt
+
+# ──────────────────────────────────────────────────────────────
+#  Editor / IDE / OS - But not used currently.
+# ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

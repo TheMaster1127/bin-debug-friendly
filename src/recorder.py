@@ -69,6 +69,7 @@ class SessionRecorder:
         stack_lines: list[str],
         stdout_text: str = "",
         note: str = "",
+        derefs: dict[str, str] | None = None,
     ) -> None:
         self.step_seq += 1
         changed_regs = [
@@ -89,6 +90,8 @@ class SessionRecorder:
             lines.append(f"  STDOUT   : {stdout_text.strip()!r}\n")
         if changed_regs:
             lines.append(f"  CHANGED  : {' '.join(changed_regs)}\n")
+        if derefs:
+            lines.append(f"  DEREF    : {' | '.join(f'{k.upper()}->{repr(s)}' for k, s in derefs.items())}\n")
 
         if disas_lines:
             lines.append("  DISASSEMBLY:\n")
