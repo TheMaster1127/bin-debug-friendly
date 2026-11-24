@@ -6,10 +6,11 @@ bin-debug-friendly — Friendly, Bubblewrap-sandboxed Linux debugger & execution
 """
 
 import argparse
+import shlex
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.resolve()))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.cli import run_interactive_cli
 from src.elf_utils import parse_elf
@@ -17,6 +18,40 @@ from src.gdb_session import GdbSession
 from src.mapper import run_execution_mapper
 from src.recorder import SessionRecorder
 from src.sandbox import SandboxEnv, confirm_disable_sandbox
+
+
+def extract_target_args_flag(argv: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Safely extracts `-A "..."` / `-a "..."` / `--args "..."` before argparse runs
+    so values starting with '-' (like `-A "-h -m -o foo"`) are never misread as
+    debugger options. Supports shell quoting and backslash-escaped quotes (`\"`).
+    """
+    cleaned: list[str] = []
+    extracted: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-A", "-a", "--args"):
+            if i + 1 >= len(argv):
+                sys.exit(f"[!] Error: {tok} requires a quoted argument string.")
+            raw_str = argv[i + 1]
+            try:
+                extracted.extend(shlex.split(raw_str))
+            except ValueError as e:
+                sys.exit(f"[!] Error parsing {tok} string ({e}): {raw_str}")
+            i += 2
+            continue
+        if tok.startswith(("-A=", "-a=", "--args=")):
+            raw_str = tok.split("=", 1)[1]
+            try:
+                extracted.extend(shlex.split(raw_str))
+            except ValueError as e:
+                sys.exit(f"[!] Error parsing {tok} string ({e}): {raw_str}")
+            i += 1
+            continue
+        cleaned.append(tok)
+        i += 1
+    return cleaned, extracted
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,13 +63,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "target_args",
         nargs="*",
-        help="Optional arguments to pass to the target binary",
+        help="Optional arguments to pass to the target binary (or use -A \"...\")",
+    )
+    parser.add_argument(
+        "-A", "-a", "--args",
+        dest="target_args_str",
+        default=None,
+        help="Quoted target argument string (supports escaped quotes \\\" and target flags like -o/-m)",
     )
     parser.add_argument(
         "-m", "-main", "--main",
         dest="start_at_main",
         action="store_true",
-        help="Start and stop at main() (errors out if no main symbol exists)",
+        help="Start and stop at main()",
     )
     parser.add_argument(
         "-record", "--record",
@@ -71,8 +112,11 @@ def main() -> None:
     if sys.platform != "linux":
         sys.exit("[!] FATAL: bin-debug-friendly is Linux-only.")
 
+    cleaned_argv, flagged_target_args = extract_target_args_flag(sys.argv[1:])
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(cleaned_argv)
+
+    all_target_args = flagged_target_args + list(args.target_args)
 
     bin_path = Path(args.binary).resolve()
     if not bin_path.is_file():
@@ -95,7 +139,7 @@ def main() -> None:
         binary_path=bin_path,
         elf_info=elf,
         sandbox=sandbox,
-        target_args=args.target_args,
+        target_args=all_target_args,
     )
 
     recorder = (
@@ -128,6 +172,7 @@ def main() -> None:
             recorder.close()
             print(f"[+] Recording saved -> {recorder.out_dir}/")
         session.close()
+
 
 if __name__ == "__main__":
     main()

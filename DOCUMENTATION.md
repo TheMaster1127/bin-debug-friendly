@@ -100,6 +100,8 @@ Raw GDB is designed for source-level debugging with DWARF debug info. Reverse-en
 | `src/recorder.py` | Idle-flushed session recorder writing `record-<bin>_<date>/full_recording.txt` and `functions/func_*.txt` with `DEREF` strings. | `SessionRecorder` |
 | `src/mapper.py` | Autonomous execution mapper generating `<bin>-mapped_<date>/` with instruction traces, `DEREF`, stack diffs, syscalls, and stats. | `run_execution_mapper()`, `classify_instruction()`, `FolderSizeGuard` |
 
+> **Note (`main.py` & `heap_dump.py`):** Both entry-point scripts pre-extract `-A`/`-a`/`--args` via `shlex.split()` before `argparse` runs so target flags (`-h`, `-m`, `-o`) and escaped quotes (`\"`) pass through cleanly, and resolve `Path(__file__).resolve().parent` so global wrapper/symlink installs always locate `src/` while writing output artifacts to `Path.cwd()`.
+
 ---
 
 ## 4. ELF32/ELF64 Parsing, `sstrip` Recovery & PIE Resolution (`src/elf_utils.py`)

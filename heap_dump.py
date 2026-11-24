@@ -12,17 +12,18 @@ Captures [heap] snapshots both:
 Works on normal, stripped, and sstripped binaries inside Bubblewrap.
 
 Usage:
-    python heap_dump.py test4                     # interactive prompt
-    python heap_dump.py test4 --input letmein123  # automated input
-    python heap_dump.py test4 --no-input          # send empty newline
+    python3 heap_dump.py test4                     # interactive prompt
+    python3 heap_dump.py test4 -A "-o flag arg2"   # pass binary arguments cleanly
+    python3 heap_dump.py test4 --input letmein123  # automated input
+    python3 heap_dump.py test4 --no-input          # send empty newline
 """
 
 import argparse
-import re
+import shlex
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.resolve()))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.elf_utils import parse_elf
 from src.formatters import prompt_for_target_stdin
@@ -38,6 +39,35 @@ WATCH_FUNCS = (
     ("free", "pre-free"),
 )
 MAX_HEAP_SNAPSHOTS = 16
+
+
+def extract_target_args_flag(argv: list[str]) -> tuple[list[str], list[str]]:
+    cleaned: list[str] = []
+    extracted: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-A", "-a", "--args"):
+            if i + 1 >= len(argv):
+                sys.exit(f"[!] Error: {tok} requires a quoted argument string.")
+            raw_str = argv[i + 1]
+            try:
+                extracted.extend(shlex.split(raw_str))
+            except ValueError as e:
+                sys.exit(f"[!] Error parsing {tok} string ({e}): {raw_str}")
+            i += 2
+            continue
+        if tok.startswith(("-A=", "-a=", "--args=")):
+            raw_str = tok.split("=", 1)[1]
+            try:
+                extracted.extend(shlex.split(raw_str))
+            except ValueError as e:
+                sys.exit(f"[!] Error parsing {tok} string ({e}): {raw_str}")
+            i += 1
+            continue
+        cleaned.append(tok)
+        i += 1
+    return cleaned, extracted
 
 
 def extract_strings(data: bytes, base: int, min_len: int) -> list[tuple[int, str]]:
@@ -90,7 +120,6 @@ def snapshot_heap(session: GdbSession, tag: str, seen_strings: dict[str, tuple[i
         if s not in seen_strings:
             seen_strings[s] = (addr, tag)
 
-    # Also catch any C-string pointers currently sitting in GPRs
     for _rname, val in session.get_registers().items():
         s = session.read_c_string(val)
         if s and len(s) >= min_len and s not in seen_strings:
@@ -133,11 +162,6 @@ def run_until_stdin_read(session: GdbSession) -> bool:
 
 
 def install_post_stdin_traps(session: GdbSession) -> dict[str, str]:
-    """
-    Sets breakpoints on libc's strcmp/memcmp/explicit_bzero/free (present in libc .dynsym
-    even when the target binary itself is sstripped!) so we snapshot [heap] BEFORE wipes.
-    """
-    # Clear the old `catch syscall` first, then watch exit_group too
     session.send("-break-delete")
     session.send('-interpreter-exec console "catch syscall exit_group"')
     session.send('-interpreter-exec console "catch syscall exit"')
@@ -154,19 +178,25 @@ def install_post_stdin_traps(session: GdbSession) -> dict[str, str]:
 
 
 def main() -> int:
+    cleaned_argv, flagged_target_args = extract_target_args_flag(sys.argv[1:])
+
     ap = argparse.ArgumentParser(
-        prog="heap_dump.py",
+        prog="bin-debug-friendly-heap",
         description="Lifecycle heap dumper (catches pre-stdin AND post-stdin/pre-wipe secrets).",
     )
     ap.add_argument("binary", help="Path to ELF binary")
-    ap.add_argument("target_args", nargs="*", help="Arguments for target binary")
+    ap.add_argument("target_args", nargs="*", help="Optional arguments for target binary (or use -A \"...\")")
+    ap.add_argument("-A", "-a", "--args", dest="target_args_str", default=None,
+                    help="Quoted target argument string (supports escaped quotes \\\" and target flags)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("-i", "--input", default=None, help="Pre-feed this string to stdin")
     g.add_argument("--no-input", action="store_true", help="Send empty newline (short for --input '')")
     ap.add_argument("--min-len", type=int, default=4, help="Minimum string length (default: 4)")
     ap.add_argument("--top", type=int, default=25, help="Number of strings to display (default: 25)")
     ap.add_argument("-o", "--output", default=None, help="Output folder")
-    args = ap.parse_args()
+    args = ap.parse_args(cleaned_argv)
+
+    all_target_args = flagged_target_args + list(args.target_args)
 
     bin_path = Path(args.binary).resolve()
     if not bin_path.is_file():
@@ -182,7 +212,7 @@ def main() -> int:
     print(f"[*] {bin_path.name} ({elf.arch}, {'PIE' if elf.is_pie else 'no-PIE'}, sstrip={'yes' if elf.is_sstripped else 'no'})")
 
     sandbox = SandboxEnv(enabled=True)
-    session = GdbSession(bin_path, elf, sandbox, target_args=args.target_args)
+    session = GdbSession(bin_path, elf, sandbox, target_args=all_target_args)
 
     out_dir = (
         Path(args.output).resolve()
@@ -213,7 +243,6 @@ def main() -> int:
         else:
             print("[*] [heap] not mapped yet at stdin (will watch post-stdin allocations)...")
 
-        # Feed input
         if args.no_input:
             session.write_target_stdin("")
         elif args.input is not None:
@@ -223,7 +252,6 @@ def main() -> int:
             if txt is not None:
                 session.write_target_stdin(txt)
 
-        # Install post-stdin lifecycle traps (catches JIT decode + explicit_bzero/free wipes!)
         bp_tags = install_post_stdin_traps(session)
 
         safety = 0
@@ -240,7 +268,6 @@ def main() -> int:
                     if snap is not None and snap != last_chunk:
                         heap_chunks.append(snap)
                         last_chunk = snap
-                    # Remove traps and let exit finish cleanly
                     session.send("-break-delete")
                     session.run_or_continue(restart_if_exited=False)
                     break

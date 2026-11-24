@@ -107,6 +107,8 @@ sudo apt install -y python3-colorama qemu-user gdb-multiarch
 chmod +x main.py heap_dump.py stack_strings.py
 ```
 
+For system-wide installation (`bin-debug-friendly`, `bin-debug-friendly-heap`, `bin-debug-friendly-strings`), see [`INSTALLATION.md`](INSTALLATION.md).
+
 ---
 
 ## 5. Synopsis & Launch Flags (`main.py`)
@@ -118,6 +120,7 @@ python3 main.py <binary> [target_args...] [OPTIONS]
 | Flag | Argument | Description |
 |------|----------|-------------|
 | `-m`, `-main`, `--main` | *(none)* | Start and automatically pause at `main()`. Supports symbol-rich binaries across all architectures, plus stripped/`sstrip`ped binaries on `x86_64` and `i386` (via `_start` recovery). Also pairs with `--map` to map from `main()` forward. |
+| `-A`, `-a`, `--args` | `"ARGS"` | Pass arguments to the target binary safely (supports quoted strings and escaped `\"`, e.g. `-A "-o out.txt \"hello \\\"world\\\"\""`). |
 | `-record`, `--record` | *(none)* | Record every interactive command, timing, disassembly context, register diff, register dereferences (`DEREF`), full active stack, and `stdout` into `record-<bin>_<DD-MM-YYYY_HH-MM-SS>/`. |
 | `-map`, `--map` | *(none)* | Run autonomous execution mapper: traces instructions, GPRs, `DEREF:` strings, active stack snapshots & diffs, system calls, and stats into `<bin>-mapped_<DD-MM-YYYY_HH-MM-SS>/`. |
 | `-func`, `--func`, `--function` | `ADDR\|SYM` | With `--map`: start tracing when `ADDR` or `SYM` is entered and automatically stop when it returns. |
@@ -392,6 +395,7 @@ A companion script to `bin-debug-friendly` that captures `[heap]` across the bin
 | `--no-input` | `False` | Send an empty newline `\n`. |
 | `--min-len N` | `4` | Minimum string length to include. |
 | `--top N` | `25` | Number of strings to print to terminal (all strings are saved to file). |
+| `-A`, `-a`, `--args` | *(none)* | Pass arguments to the target binary (supports quotes and escaped `\"`). |
 | `-o`, `--output` | `./<bin>_heapdump` | Custom output directory. |
 
 ### Real Observed Run on `sstrip`ped `test4`
