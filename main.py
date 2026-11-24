@@ -129,6 +129,5 @@ def main() -> None:
             print(f"[+] Recording saved -> {recorder.out_dir}/")
         session.close()
 
-
 if __name__ == "__main__":
     main()
